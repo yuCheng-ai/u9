@@ -19,6 +19,17 @@
 - **动态决算引擎**: 
     - 开发者需实现“完工百分比 (POC)”算法。
     - **公式**: `POC = 实际发生额 / 预计总成本`。根据 POC 自动触发收入确认凭证。
+- **技术实现建议**: 
+    - 使用 PostgreSQL 的 **Window Functions** 实时计算项目各阶段的累计支出，无需存储中间统计表，确保数据实时性。
+    - 使用 `JSONB` 存储不同项目的个性化预算控制规则（如：某些项目允许超支 5%，某些严禁超支）。
+    - **示例代码**:
+      ```sql
+      -- 使用窗口函数计算项目累计支出与预算执行率
+      SELECT project_id, budget_amt, 
+             SUM(actual_amt) OVER(PARTITION BY project_id) as total_actual,
+             (SUM(actual_amt) OVER(PARTITION BY project_id) / budget_amt) * 100 as execution_rate
+      FROM pjm_budget_ledger;
+      ```
 
 ---
 
@@ -34,6 +45,9 @@
 - **虚拟项目池 (Project Pool)**: 
     - 对于通用件，开发者可设计“虚拟项目 000”。
     - **逻辑**: 当特定项目缺货时，允许自动从“000 池”进行 `Stock_Reassignment`（库存重分配）。
+- **技术实现建议**: 
+    - 利用 PostgreSQL 的 **Advisory Locks (咨询锁)** 确保跨项目的库存借调/重分配操作的原子性，防止并发下的库存超扣。
+    - 为 `(item_id, project_id, lot_id)` 复合字段建立 **B-Tree 索引**，提升专料专用的库存查询效率。
 
 ---
 
@@ -50,6 +64,9 @@
         - 借入方：`DR 库存 (Project_A) CR 待支付项目款 (Org_B)`。
 - **归还提醒 Job**: 
     - 开发者需写一个 Job，当项目 A 的补货采购单到货时，自动弹出“归还项目 B”的提醒。
+- **技术实现建议**: 
+    - 使用 PostgreSQL 的 **SKIP LOCKED** 特性实现高性能的“归还提醒”后台任务扫描，支持多节点并发处理而不会发送重复提醒。
+    - 使用 `JSONB` 记录借调时的成本快照，确保归还时按原价冲回，不受后续价格波动影响。
 
 ---
 
@@ -63,7 +80,21 @@
     - 开发者需实现 WBS 节点与生产订单 (MO) 的 `1:N` 关联。
     - **逻辑**: WBS 节点的 `Start_Date` 自动约束 MO 的 `Earliest_Start_Date`。
 - **进度自动反馈**: 
-    - 开发者需确保 MO 完工入库后，自动更新 WBS 任务的 `Progress_Percentage`。
+    - 开发者需确保 MO完工入库后，自动更新 WBS 任务的 `Progress_Percentage`。
+- **技术实现建议**: 
+    - 利用 PostgreSQL 的 **Recursive CTE** 处理无限层级的 WBS 结构查询，快速计算整个项目的总进度。
+    - 在 WBS 表上应用 **Exclusion Constraints (排除约束)**，防止同一项目下的关键资源在同一时间段被分配给多个冲突的任务。
+    - **示例代码**:
+      ```sql
+      -- 递归计算 WBS 节点进度（按子节点权重加权平均）
+      WITH RECURSIVE wbs_progress AS (
+          SELECT id, parent_id, weight, progress FROM project_wbs WHERE id = :root_node
+          UNION ALL
+          SELECT w.id, w.parent_id, w.weight, w.progress FROM project_wbs w
+          JOIN wbs_progress p ON w.parent_id = p.id
+      )
+      SELECT SUM(progress * weight) / SUM(weight) FROM wbs_progress;
+      ```
 
 ---
 

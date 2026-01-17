@@ -16,6 +16,14 @@ U9 阿米巴经营会计是基于稻盛和夫经营哲学的落地实践。对�
     - `Type`: 制造型（利润中心）、销售型（利润中心）、职能型（费用/服务中心）。
     - `Level`: 支持树状递归查询，用于损益逐级汇总。
 
+### PostgreSQL 实现建议
+- **LTREE 层次结构**: 使用 `LTREE` 扩展来存储阿米巴组织树。这使得查询“某单元及其所有下级”或“某单元的所有上级”变得极其高效且语法简洁。
+  ```sql
+  -- 查询 A 单元及其所有子单元的损益汇总
+  SELECT sum(amount) FROM amoeba_trading WHERE path <@ 'Group.Factory1.ShopA';
+  ```
+- **JSONB 属性扩展**: 阿米巴单元通常有许多自定义的考核指标。使用 `JSONB` 存储这些非核心属性，既能保证灵活性，又可以通过 `GIN` 索引保持高性能检索。
+
 ### 1.2 内部交易记录 (Internal Trading Record)
 这是阿米巴核算的“灵魂”。每当货物或服务在两个单元间流转，系统需生成一条内部交易记录。
 - **触发源**: 
@@ -24,18 +32,32 @@ U9 阿米巴经营会计是基于稻盛和夫经营哲学的落地实践。对�
     - 跨部门领料 (Internal Requisition)
 - **核心字段**: `Sender_Amoeba`, `Receiver_Amoeba`, `Price_Policy_ID`, `Quantity`, `Amount`.
 
+### PostgreSQL 实现建议
+- **分区表 (Partitioning)**: 内部交易记录数据量巨大。建议按月对 `amoeba_trading` 表进行分区，提高历史数据清理效率和月度结算查询速度。
+- **物化视图 (Materialized View)**: 对于实时性要求不高但计算复杂的阿米巴损益看板，使用物化视图缓存结果，并在业务低峰期刷新。
+
 ---
 
-## 2. 内部定价逻辑 (Price Determination) - 开发逻辑重难点
+## 2. 内部定价逻辑 (Price Determination)
 
-开发者必须实现的定价优先级逻辑如下：
-
+### 开发逻辑点
 1.  **协议定价 (Contract Price)**: 检查两个特定阿米巴单元之间是否存在生效的协议价格表。
 2.  **标准/市场价 (Standard Price)**: 若无协议价，查找物料主文件或价格库中的“内部参考价”。
 3.  **成本加成 (Cost Plus)**: 
     - `公式: 内部结算价 = 实际成本 * (1 + 利润率)`
     - 开发者需实时计算前序工序的累积成本。
 4.  **手动调整 (Manual Adjustment)**: 允许在特定权限下对系统计算的价格进行干预，并记录审计日志。
+
+### PostgreSQL 实现建议
+- **时间范围约束 (DATERANGE)**: 价格表使用 `daterange` 字段配合 `GIST` 索引的 `EXCLUDE` 约束，确保任意两个单元间的同一种物料在同一时间内只有一个生效价格。
+  ```sql
+  ALTER TABLE internal_price_list ADD EXCLUDE USING gist (
+    amoeba_pair_id WITH =, 
+    item_id WITH =, 
+    valid_period WITH &&
+  );
+  ```
+- **自定义函数逻辑控制**: 将复杂的定价优先级逻辑（从协议价到成本加成）封装在 `PL/pgSQL` 函数中，确保在批量生成交易记录时，逻辑的一致性与高性能。
 
 ---
 
@@ -60,10 +82,22 @@ U9 阿米巴经营会计是基于稻盛和夫经营哲学的落地实践。对�
     - 按收入占比分摊（集团管理费）。
 - **递归分摊**: 职能部门 A 分摊给职能部门 B，再由 B 分摊给业务部门。系统需防止死循环。
 
+### PostgreSQL 实现建议
+- **递归 CTE 分摊**: 使用 `WITH RECURSIVE` 处理多级费用分摊。在 SQL 层直接完成分摊链条的展开，避免在应用层进行多次循环查询。
+- **窗口函数计算占比**: 
+  ```sql
+  SELECT amoeba_id, 
+         amount * (headcount / SUM(headcount) OVER()) as allocated_amount
+  FROM expenses;
+  ```
+  利用窗口函数一次性完成分母汇总与分子分摊，性能远优于子查询。
+
 ### 3.3 单位时间核算 (Hourly Value)
 这是衡量阿米巴效率的终极指标。
-- `公式: 单位时间附加值 = (经营利润 + 劳务费) / 总劳动时间`
-- **开发注意**: 需集成 HR 模块或考勤系统获取“总劳动时间”。
+- `公式: 单位时间附加值 = (经营利润 +劳务费) / 总劳动时间`
+
+### PostgreSQL 实现建议
+- **跨库查询 (postgres_fdw)**: 如果 HR/考勤系统在独立的数据库中，利用 `postgres_fdw` 将考勤数据映射为本地表，直接在阿米巴计算 SQL 中关联，无需繁琐的 ETL 过程。
 
 ---
 

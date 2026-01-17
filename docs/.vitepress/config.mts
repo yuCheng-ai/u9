@@ -15,8 +15,7 @@ export default defineConfig({
         text: '产品入门',
         items: [
           { text: '产品概览', link: '/index' },
-          { text: 'U9 cloud 核心理念 (多组织/多核算)', link: '/guide/introduction' },
-          { text: '系统快速上手', link: '/guide/getting-started' }
+          { text: '核心理念 (多组织/多核算)', link: '/guide/introduction' }
         ]
       },
       {

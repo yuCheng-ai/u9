@@ -14,6 +14,10 @@
 - **成本域 (Cost Domain)**: 这是核算的边界。开发者在做单价计算时，必须按 `CostDomainID + ItemID` 进行 Group By，而非 `OrgID`。
 - **成本中心 (Cost Center)**: 费用归集的容器。每一个制造费用凭证必须关联 `CostCenterID`。
 
+### PostgreSQL 实现建议
+- **复合索引优化**: 在 `inventory_transaction` 表上对 `(cost_domain_id, item_id, transaction_date)` 建立复合索引，极大地提升月度加权平均单价的计算速度。
+- **行级安全 (RLS)**: 对不同成本域的数据应用 RLS，确保财务人员只能在其权限范围内的成本域执行核算操作，防止跨域数据污染。
+
 ---
 
 ## 2. 费用归集与分摊引擎 (Allocation Engine)
@@ -30,6 +34,17 @@
     - 辅助生产部门（如动力车间） -> 生产车间 -> 生产订单。
     - **开发注意**: 必须实现“交互分配法”，处理部门之间的相互服务（循环分摊），通常需要迭代计算或解线性方程组。
 
+### PostgreSQL 实现建议
+- **窗口函数计算占比**: 
+  ```sql
+  SELECT mo_id, 
+         labor_hours, 
+         labor_hours / SUM(labor_hours) OVER(PARTITION BY cost_center_id) as ratio
+  FROM mo_reporting;
+  ```
+  利用窗口函数直接在 SQL 层完成分摊比例计算，避免在应用层进行两次汇总查询。
+- **物化视图预汇总**: 将常用的分摊动因（如各订单累计工时、各产品月度产量）预先汇总到物化视图中，提升分摊引擎的执行效率。
+
 ---
 
 ## 3. 多级卷积计算 (Multi-level Rollup)
@@ -43,6 +58,19 @@
 - **卷积逻辑**:
     - `本级成本 = 直接材料 (由下级传递) + 直接人工 (本级报工) + 制造费用 (分摊所得)`。
 
+### PostgreSQL 实现建议
+- **递归 CTE 计算低层码**: 
+  ```sql
+  WITH RECURSIVE bom_levels AS (
+    SELECT child_id, 1 as level FROM bom_struct WHERE parent_id IS NULL
+    UNION ALL
+    SELECT b.child_id, bl.level + 1 FROM bom_struct b JOIN bom_levels bl ON b.parent_id = bl.child_id
+  )
+  SELECT child_id, MAX(level) as low_level_code FROM bom_levels GROUP BY child_id;
+  ```
+  使用递归 CTE 高效生成全量物料的低层码，这是成本卷积的基础。
+- **临时表缓存中间结果**: 在 `PL/pgSQL` 中使用 `LOCAL TEMPORARY TABLE` 存储每一层级的计算结果，减少对物理表的频繁 I/O。
+
 ---
 
 ## 4. 在制品 (WIP) 与完工结算
@@ -53,6 +81,11 @@
 ### 开发逻辑点
 - **约当产量法**: 开发者需根据工序的“完工程度”（如 50%），将 WIP 折算为成品数量参与分摊。
 - **尾差处理**: 在最后一步结算时，必须实现 `总成本 - 已完工成本 = 留存 WIP 成本`，防止因为四舍五入导致总账不平。
+
+### PostgreSQL 实现建议
+- **精确数值运算 (NUMERIC)**: 全程使用 `NUMERIC(28, 10)` 进行成本计算，仅在最后生成财务凭证时进行舍入，最大限度减少计算尾差。
+- **触发器实时监控**: 在成本结算表上设置触发器，实时校验 `input = output` 的平衡关系，一旦失衡立即阻断操作并报警。
+- **JSONB 记录分摊轨迹**: 将每一笔成本的构成明细（料、工、费）以 `JSONB` 格式记录在结算行中，实现“一键追溯”成本来源。
 
 ---
 

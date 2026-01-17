@@ -17,6 +17,16 @@
     - **模式 2: 申请审批 (Workflow-based)**: 分子公司发起 `Master_Data_Request`，总部核准后自动同步。
 - **全局唯一 ID (Global_UID)**: 
     - 开发者必须确保跨组织的主数据具有相同的 `Mapping_Key`，以便在合并报表时进行 `JOIN` 操作。
+- **技术实现建议**: 
+    - 使用 **JSONB** 存储复杂的管控策略。例如，可以定义哪些字段由总部控制，哪些允许分公司修改。
+    - 利用 PostgreSQL 的 **Logical Decoding** 或 **Subscription** 机制实现主数据从集团到分公司的实时、高可靠同步。
+    - **示例代码**:
+      ```sql
+      -- 使用 JSONB 定义主数据字段管控权限
+      -- 'R' 为只读，'W' 为可写
+      SELECT policy_data->>'item_name' as name_perm, policy_data->>'spec' as spec_perm
+      FROM governance_policy WHERE org_id = :org_id AND entity_type = 'Item';
+      ```
 
 ---
 
@@ -32,6 +42,18 @@
     - **往来抵消**: `SUM(AR where Partner == Org_B) - SUM(AP where Partner == Org_A)`。
     - **损益抵消**: 开发者需追踪内部交易的“未实现利润”。
     - **算法**: `IF (Item_Still_In_Inventory) THEN 抵消该部分利润 ELSE 确认利润`。
+- **技术实现建议**: 
+    - 使用 PostgreSQL 的 **Window Functions (窗口函数)** 进行内部对账，快速识别金额不匹配的交易。
+    - 使用 **Recursive CTE** 追踪内部利润在多级组织间的流转路径。
+    - **示例代码**:
+      ```sql
+      -- 快速识别内部往来差异
+      SELECT partner_org, SUM(balance) FILTER (WHERE acc_type = 'AR') as ar_sum,
+             SUM(balance) FILTER (WHERE acc_type = 'AP') as ap_sum
+      FROM gl_ledger WHERE is_internal = true
+      GROUP BY partner_org
+      HAVING SUM(balance) FILTER (WHERE acc_type = 'AR') != SUM(balance) FILTER (WHERE acc_type = 'AP');
+      ```
 
 ---
 
@@ -47,6 +69,16 @@
 - **穿透路径设计**: 
     - 集团汇总数 -> 组织明细数 -> 组织原始凭证 -> 协同业务单据。
     - 开发者需维护 `Origin_Org_ID` 和 `Origin_Voucher_ID` 的链条。
+- **技术实现建议**: 
+    - 针对海量余额表数据，使用 PostgreSQL 的 **Table Partitioning (表分区)**，按会计年度或组织进行分区，显著提升查询性能。
+    - 使用 **Materialized View** 存储中间合并结果，支持“秒级”出表。
+    - **示例代码**:
+      ```sql
+      -- 创建按年度分区的合并余额表
+      CREATE TABLE gl_consolidated_ledger (
+          year int, org_id int, account_id int, balance numeric
+      ) PARTITION BY RANGE (year);
+      ```
 
 ---
 
@@ -61,6 +93,15 @@
     - **逻辑**: 分子公司默认继承集团的 `Control_Param`，除非集团显式授权 `Allow_Local_Override`。
 - **预算硬控制**: 
     - 开发者需实现跨组织的 `Global_Budget_Check` API，支持集团对分公司的费用总额进行远程冻结。
+- **技术实现建议**: 
+    - 利用 PostgreSQL 的 **Advisory Locks (咨询锁)** 实现跨组织的分布式资源竞争控制（如集团层面的信用配额抢占）。
+    - 使用 **Generated Columns** 实时计算分公司的预算执行率，方便总部监控。
+    - **示例代码**:
+      ```sql
+      -- 使用咨询锁确保集团预算扣减的原子性
+      SELECT pg_advisory_xact_lock(:group_budget_id);
+      UPDATE group_budgets SET used_amount = used_amount + :req_amount WHERE id = :group_budget_id;
+      ```
 
 ---
 

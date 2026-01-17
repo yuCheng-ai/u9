@@ -19,6 +19,11 @@
 - **排程公式**: `Total_Operation_Time = Setup_Time + (Run_Time * Order_Qty) + Wait_Time + Move_Time`。
 - **开发注意**: 所有的工时必须支持“秒/分/时”的单位转换，且精度至少保留 4 位小数。
 
+### PostgreSQL 实现建议
+- **数值类型精度 (NUMERIC)**: 使用 `NUMERIC(20, 4)` 存储工时，确保在进行单位换算（如：秒转时）时不会出现浮点数精度丢失。
+- **时间跨度计算 (INTERVAL)**: 利用 PG 的 `INTERVAL` 类型处理工序间的等待和移动时间，方便进行日期加减运算：`plan_finish_date = plan_start_date + (total_time * interval '1 second')`。
+- **自定义函数封装**: 编写 `PL/pgSQL` 函数统一计算总工时，方便在视图和触发器中复用排程公式。
+
 ---
 
 ## 2. 工作中心与资源能力 (Work Center & Capacity)
@@ -34,6 +39,18 @@
     - 在排产接口中，开发者需增加“超载拦截”或“自动顺延”逻辑。
     - **算法**: `Next_Available_Start_Date = MAX(Resource_Busy_Until, Material_Ready_Date)`。
 
+### PostgreSQL 实现建议
+- **GIST 索引与排除约束**: 
+  ```sql
+  ALTER TABLE resource_allocation ADD EXCLUDE USING gist (
+    resource_id WITH =,
+    busy_period WITH &&
+  );
+  ```
+  利用排除约束（Exclusion Constraints）确保同一资源在同一时间段内不会被重叠占用。
+- **窗口函数计算负载**: 使用 `SUM(allocated_hours) OVER(PARTITION BY resource_id ORDER BY date)` 实时计算资源的滚动负荷，识别瓶颈工序。
+- **UNLOGGED TABLE 性能优化**: 排产模拟过程中的临时负载计算可以使用 `UNLOGGED TABLE`，减少磁盘 I/O，大幅提升计算速度。
+
 ---
 
 ## 3. 委外工序的逻辑穿透 (Subcontracting Operation)
@@ -48,6 +65,20 @@
 - **物流跟踪**: 
     - 开发者需设计 `Operation_Transfer_Out`（发出给委外商）和 `Operation_Transfer_In`（从委外商收回）事务，确保 WIP 价值链不断裂。
 
+### PostgreSQL 实现建议
+- **触发器联动**: 在工序流转表上设置 `AFTER UPDATE` 触发器，当委外工序状态变为“待发出”时，自动向 `purchase_request` 表插入记录。
+- **JSONB 记录物流轨迹**: 
+  ```jsonb
+  {
+    "subcontractor": "Vendor_A",
+    "shipped_at": "2023-10-01",
+    "expected_back": "2023-10-05",
+    "tracking_no": "SF123456"
+  }
+  ```
+  利用 `JSONB` 存储动态的外协物流信息，无需为每种外协业务修改表结构。
+- **外部数据源 (postgres_fdw)**: 如果委外商使用了独立的协作系统，可以通过 `postgres_fdw` 直接在 ERP 中查询外协进度。
+
 ---
 
 ## 4. 关键工序与移动控制 (Move Control)
@@ -61,6 +92,20 @@
     - **逻辑**: 只有在 `Qualified_Qty` 产生后，才允许调用 `Operation_Move_API`。
 - **关键路径 (Critical Path)**: 
     - 开发者需支持“里程碑汇报”。只有关键工序汇报了，才更新 MO 的整体百分比进度。
+
+### PostgreSQL 实现建议
+- **递归 CTE 路径检查**: 
+  ```sql
+  WITH RECURSIVE op_path AS (
+    SELECT id, next_op_id, is_completed FROM routing WHERE mo_id = ? AND op_seq = 1
+    UNION ALL
+    SELECT r.id, r.next_op_id, r.is_completed FROM routing r JOIN op_path p ON r.id = p.next_op_id
+  )
+  SELECT bool_and(is_completed) FROM op_path WHERE id < current_op_id;
+  ```
+  使用递归查询确保当前工序之前的所有必要步骤均已完成。
+- **触发器维护进度**: 在汇报表上设置触发器，实时累加关键工序产出，并更新 MO 主表的 `completion_percentage` 字段。
+- **布尔索引**: 对 `is_critical_path` 字段建立索引，加速进度看板的查询性能。
 
 ---
 

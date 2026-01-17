@@ -17,6 +17,22 @@
     - **关键键值**: 必须在两张单据上保存 `Source_Document_GUID`，作为后续所有关联查询的唯一索引。
 - **状态强一致性**: 
     - 开发者需确保：B 组织 `Shipment` (发货) 后，系统通过 `Cross_Org_Service` 自动在 A 组织执行 `Receipt` (收货)。
+- **技术实现建议**: 
+    - 利用 PostgreSQL 的 **Logical Decoding** 或 **Trigger + NOTIFY** 机制。当 A 组织单据核准时，数据库触发器发送通知，异步服务监听通知并执行跨组织抛单。
+    - **示例代码**:
+      ```sql
+      -- 使用 NOTIFY 触发异步协同任务
+      CREATE OR REPLACE FUNCTION notify_collab_bridge() RETURNS trigger AS $$
+      BEGIN
+          PERFORM pg_notify('collab_task', json_build_object(
+              'source_org', NEW.org_id,
+              'doc_id', NEW.id,
+              'doc_type', 'IPO'
+          )::text);
+          RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+      ```
 
 ---
 
@@ -33,6 +49,9 @@
         - 2. 系统自动触发 A 组织（销售公司）的 `Virtual_Receipt` 和 `Virtual_Shipment`。
 - **价差处理**: 
     - A 卖给客户 100 元，B 卖给 A 80 元。开发者需确保 A 组织的凭证上正确反映这 20 元的内部利润。
+- **技术实现建议**: 
+    - 使用 **UNLOGGED TABLE** 处理临时的、仅用于计算的虚拟库存对冲数据，提升高并发直运场景下的写入性能。
+    - 使用 `JSONB` 存储直运链路中的多级分润协议，方便动态调整。
 
 ---
 
@@ -49,6 +68,19 @@
         - B 组织：自动生成 `Standard_MO`。
 - **物料追溯**: 
     - 开发者必须实现跨组织的 `Lot_Traceability`。确保 A 组织发出的批次号在 B 组织加工后，能正确带回给 A 组织。
+- **技术实现建议**: 
+    - 利用 PostgreSQL 的 **Recursive CTE** 实现跨组织的批次全生命周期追溯，穿透组织边界。
+    - **示例代码**:
+      ```sql
+      -- 跨组织递归追溯物料批次
+      WITH RECURSIVE cross_org_trace AS (
+          SELECT lot_id, org_id, parent_lot_id FROM lot_master WHERE lot_id = :target_lot
+          UNION ALL
+          SELECT l.lot_id, l.org_id, l.parent_lot_id FROM lot_master l
+          JOIN cross_org_trace t ON l.lot_id = t.parent_lot_id
+      )
+      SELECT * FROM cross_org_trace;
+      ```
 
 ---
 
@@ -63,6 +95,18 @@
     - **取价优先级**: 1. 协议特定价 -> 2. 成本加成价 -> 3. 标准转让价。
 - **自动对账引擎**: 
     - 开发者需构建一个 `Unmatched_Internal_Transaction_View`，实时扫描 A 组织已收货但 B 组织未发货，或金额不一致的异常。
+- **技术实现建议**: 
+    - 使用 **Materialized View (物料化视图)** 定期刷新内部交易对账结果，降低实时查询对核心库的压力。
+    - 利用 **Postgres_fdw** (Foreign Data Wrapper) 如果不同组织的数据分布在不同的数据库实例上，实现跨实例的联邦查询对账。
+    - **示例代码**:
+      ```sql
+      -- 创建物料化视图加速内部对账
+      CREATE MATERIALIZED VIEW mv_internal_reconcile AS
+      SELECT a.doc_no, a.amount as buy_amt, b.amount as sell_amt
+      FROM purchase_order a
+      JOIN sales_order b ON a.src_guid = b.guid
+      WHERE a.is_internal = true AND a.amount != b.amount;
+      ```
 
 ---
 

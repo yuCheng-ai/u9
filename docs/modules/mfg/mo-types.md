@@ -17,6 +17,11 @@
     - **改制订单**: 需处理“旧品退库”与“新品入库”的价值转换。
 - **成本隔离**: 开发者在设计数据库索引时，必须确保 `Cost_Center` 和 `MO_Type` 是核心查询维度，防止不同类型的订单成本混淆。
 
+### PostgreSQL 实现建议
+- **枚举类型 (ENUM)**: 使用 `CREATE TYPE mo_type AS ENUM ('Standard', 'Rework', 'Refurbish')` 提高数据存储效率和可读性，并配合 `CHECK` 约束实现业务逻辑分支。
+- **部分索引 (Partial Index)**: 针对不同类型的订单创建部分索引，例如：`CREATE INDEX idx_rework_mo ON mo_header (id) WHERE mo_type = 'Rework'`，加速特定业务场景的检索。
+- **视图解耦**: 创建 `v_standard_mo`, `v_rework_mo` 等视图，将不同类型订单的特有逻辑封装在视图中，简化应用层开发。
+
 ---
 
 ## 2. 备料明细的动态生成 (Component List Logic)
@@ -32,6 +37,21 @@
     - 如果用户确实想同步最新 BOM，开发者需提供一个 `Update_Component_List` 接口。
     - **开发注意**: 必须检查“已领料量”，如果已领料，则不允许随意删除备料行。
 
+### PostgreSQL 实现建议
+- **JSONB 存储快照**: 将审核时的完整 BOM 树以 `JSONB` 格式存储在 `mo_header.bom_snapshot` 中，既保留了原始结构，又方便进行版本比对。
+- **触发器保护数据**: 
+  ```sql
+  CREATE OR REPLACE FUNCTION check_material_issued() RETURNS TRIGGER AS $$
+  BEGIN
+    IF EXISTS (SELECT 1 FROM mo_material_issue WHERE component_id = OLD.id AND issued_qty > 0) THEN
+      RAISE EXCEPTION 'Cannot delete component that has already been issued.';
+    END IF;
+    RETURN OLD;
+  END;
+  $$ LANGUAGE plpgsql;
+  ```
+- **批量插入优化**: 同步 BOM 时，使用 `INSERT INTO ... SELECT` 结合 `ON CONFLICT` 语法，实现高效的增量更新。
+
 ---
 
 ## 3. 状态机的原子性切换 (State Machine)
@@ -46,6 +66,17 @@
 - **状态回滚**: 
     - 结案（Close）是一个复杂的事务，涉及 WIP 结转。开发者必须确保该操作的幂等性，并支持在特定条件下的“反结案”操作。
 
+### PostgreSQL 实现建议
+- **行级安全策略 (RLS)**: 
+  ```sql
+  CREATE POLICY mo_status_control ON mo_component_list
+  FOR UPDATE USING (
+    EXISTS (SELECT 1 FROM mo_header WHERE id = mo_id AND status IN ('Approved', 'Released'))
+  );
+  ```
+- **状态变更记录 (Audit Table)**: 使用触发器自动将状态变更记录到 `mo_status_history` 表中，包含操作人、时间、旧状态、新状态，利用 `JSONB` 记录变更上下文。
+- **事务保存点 (SAVEPOINT)**: 在结案等复杂事务中，利用 `SAVEPOINT` 实现局部回滚，提高系统的容错能力。
+
 ---
 
 ## 4. 关键指标计算 (KPI Calculation)
@@ -57,6 +88,11 @@
 - **进度百分比**: `Progress = (已完工入库量 / 订单计划量) * 100%`。
 - **料品齐套率**: `Kitting_Rate = (已领料项数 / 总备料项数) * 100%`。
 - **损耗率异常报警**: `IF (实际领料 > 标准用量 * (1 + 预设损耗率)) THEN 发送消息通知 QC`。
+
+### PostgreSQL 实现建议
+- **生成列 (Generated Columns)**: 对于简单的进度计算，可以使用存储生成的列：`progress NUMERIC GENERATED ALWAYS AS (completed_qty / plan_qty) STORED`。
+- **窗口函数汇总**: 使用 `SUM(...) OVER(PARTITION BY ...)` 实时计算各车间、各生产线的累计产出与达成率。
+- **异步报警机制**: 配合 `pg_cron` 或外部监控工具，定期扫描损耗异常记录，并通过 `NOTIFY` 触发即时通讯提醒。
 
 ---
 

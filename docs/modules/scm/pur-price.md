@@ -13,13 +13,18 @@
 ### 开发逻辑点
 - **分级价格模型 (Tiered Pricing)**: 
     - 开发者需支持 `Price_Break` 逻辑。
-    - **逻辑**: `IF (Qty >= 1000) THEN Price = 0.8 ELSE Price = 1.0`。
+    - **PG 实现建议**: 使用 **JSONB** 存储分级阶梯价，避免为每个物料创建过多的关联行，并利用 `->>` 操作符进行快速检索。
 - **有效期过滤**: 
     - 所有的价格获取接口必须强制传入 `Date` 参数。
-    - **SQL 逻辑**: `WHERE start_date <= :today AND end_date >= :today`。
+    - **PG 实现建议**: 利用 PostgreSQL 的 **`daterange`** 类型和 **`GIST` 索引** 实现极其高效的有效期重叠检查。
+    ```sql
+    -- 检查价格有效期是否重叠
+    ALTER TABLE pur_price_list 
+    ADD EXCLUDE USING gist (supplier_id WITH =, item_id WITH =, validity_range WITH &&);
+    ```
 - **币种与税率转换**: 
     - 开发者需自动处理汇率换算。
-    - **公式**: `含税本币价 = 外币价 * 汇率 * (1 + 税率)`。
+    - **PG 实现建议**: 利用 PostgreSQL 的 **`numeric`** 类型进行高精度计算，防止在处理 6-8 位单价小数时出现舍入误差。
 
 ---
 
@@ -31,11 +36,10 @@
 ### 开发逻辑点
 - **价格足迹 (Price Trace)**: 
     - 开发者需维护 `Price_History` 表。
-    - **逻辑**: 每当一个新的询价单（RFQ）转化为价格表时，自动记录旧价格的失效原因。
+    - **PG 实现建议**: 使用 **窗口函数 (Window Functions)** 实现价格走势分析（如：同比、环比、移动平均价）。
 - **多维度比价算法**: 
     - 开发者需实现一个“最优选商引擎”。
-    - **因子**: `Price (60%) + LeadTime (20%) + QualityScore (20%)`。
-    - **输出**: 自动标记出 `Lowest_Price` 和 `Best_Value` 供应商。
+    - **PG 实现建议**: 使用 **自定义聚合函数 (Custom Aggregates)** 或 **存储过程 (PL/pgSQL)** 将多维评分逻辑封装在数据库端，提高计算响应速度。
 
 ---
 
@@ -46,11 +50,11 @@
 
 ### 开发逻辑点
 - **执行进度监控**: 
-    - 开发者需在 `Contract_Header` 维护 `Executed_Amount` 和 `Remaining_Amount`。
+    - 开发者需在 `Contract_Header` 维护执行进度。
+    - **PG 实现建议**: 利用 PostgreSQL 的 **咨询锁 (Advisory Locks)** 在采购单审核瞬间锁定合同额度，防止高并发下的“超卖/超买”现象。
 - **强控逻辑**: 
-    - 在采购单（PO）审核 API 中增加拦截：`IF (PO.Total + Contract.Executed > Contract.Max_Limit) THEN REJECT`。
-- **自动冲销**: 
-    - PO 审核时扣减合同额度，PO 作废时恢复额度。
+    - 在采购单（PO）审核 API 中增加拦截。
+    - **PG 实现建议**: 使用 **触发器 (Triggers)** 自动更新合同已执行金额，并在超过上限时抛出 `EXCEPTION` 强制事务回滚。
 
 ---
 
@@ -61,16 +65,17 @@
 
 ### 开发逻辑点
 - **价格偏离度检查**: 
-    - 开发者需在 PO 保存前对比 `Item.Standard_Cost` 或 `Item.Last_Purchase_Price`。
-    - **逻辑**: `IF (ABS(NewPrice - OldPrice) / OldPrice > Threshold) THEN 强制进入高层审批流`。
+    - 开发者需在 PO 保存前对比。
+    - **PG 实现建议**: 使用 **LATERAL JOIN** 快速获取每个 Item 的最新三笔采购单价并计算平均偏离度。
 - **最低价锁定**: 
-    - 开发者可配置 `Is_Lowest_Price_Only` 开关。如果开启，系统严禁采购员选择非最低价供应商，除非填写 `Reason_Code`。
+    - 开发者可配置 `Is_Lowest_Price_Only` 开关。
+    - **PG 实现建议**: 利用 PostgreSQL 的 **`CHECK` 约束** 结合自定义函数，在数据库层级强制执行最低价校验。
 
 ---
 
 ## 5. 开发者 Checklist
 
-- [ ] **精密精度**: 采购单价通常需要 6-8 位小数（处理高价值小件）。
-- [ ] **分布式缓存**: 价格表查询极其频繁，是否对 `Price_List` 做了热点数据缓存？
+- [ ] **多租户隔离**: 是否通过 **RLS** 确保不同事业部的采购价格表物理隔离？
+- [ ] **高频查询优化**: 是否对常用的 `(supplier_id, item_id, validity_range)` 组合建立了 **GIST** 或 **BRIN** 索引？
 - [ ] **供应商黑名单**: 询价单接口是否自动过滤了黑名单中的供应商？
-- [ ] **附件安全**: 询价单关联的图纸附件是否实现了权限加密？
+- [ ] **审计记录**: 是否利用 **`JSONB`** 存储了价格调整的所有原始参数（包含当时的汇率、批量、税率快照）？

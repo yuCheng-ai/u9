@@ -13,10 +13,16 @@
 ### 开发逻辑点
 - **账面快照 (Account Snapshot)**: 
     - 开发者需实现“一键冻结账面数”功能。
-    - **逻辑**: 在 `Count_Sheet` 生成瞬间，将 `Inventory.On_Hand_Qty` 复制到 `Count_Line.Snapshot_Qty`。
+    - **PG 实现建议**: 利用 PostgreSQL 的 **`CREATE TABLE ... AS SELECT`** 或 **`INSERT INTO ... SELECT`** 快速创建静态快照表。对于极大规模数据，可以使用 **`COPY`** 命令提高备份效率。
 - **差异平衡逻辑**: 
     - 盘点期间发生的收发货记录，开发者不应直接修改快照，而是记录在 `Inventory_Transaction_After_Snapshot` 中。
-    - **计算公式**: `实际差异 = (实盘数 + 快照后发货量 - 快照后入库量) - 快照账面数`。
+    - **PG 实现建议**: 使用 **窗口函数 (Window Functions)** 结合时间戳，自动回溯盘点时刻的精确余额，而无需物理锁定仓库。
+    ```sql
+    -- 回溯特定时间点的库存余额
+    SELECT item_id, SUM(change_qty) FILTER (WHERE trans_time <= '2023-10-01 08:00:00') as snapshot_balance
+    FROM inventory_transactions
+    GROUP BY item_id;
+    ```
 
 ---
 
@@ -28,11 +34,9 @@
 ### 开发逻辑点
 - **自动对冲单据**: 
     - 开发者需提供“差异审批通过后自动记账”接口。
-    - **逻辑**: 
-        - 盘盈 -> 自动生成 `Inventory_In_Voucher`（入库单），成本价取 `Item.Standard_Cost` 或 `Last_Purchase_Price`。
-        - 盘亏 -> 自动生成 `Inventory_Out_Voucher`（出库单），原因代码关联 `Stock_Loss`。
-- **财务分录触发**: 
-    - 盘点差异必须自动推送至 AEP（核算平台），生成 `待处理财产损溢` 科目凭证。
+    - **PG 实现建议**: 将盘点单及其生成的入/出库单据封装在同一个 **数据库事务 (Transaction)** 中，利用 **`SAVEPOINT`** 实现复杂的错误回滚逻辑，确保库存与财务单据的一致性。
+- **差异分析扩展**:
+    - **PG 实现建议**: 使用 **JSONB** 存储盘点过程中的异常记录（如：破损图片路径、现场备注、复核人轨迹），方便后续审计且不增加主表字段压力。
 
 ---
 
@@ -48,6 +52,7 @@
     - C 类: 每年盘点。
 - **调度引擎**: 
     - 开发者需编写一个 Job，每天根据 `Item.Last_Count_Date` 和 `ABC_Class` 自动产生 `Suggested_Count_Task`。
+    - **PG 实现建议**: 使用 **`pg_cron`** 扩展直接在数据库层级调度盘点任务生成逻辑，减少对外部中间件的依赖。
 
 ---
 
@@ -59,15 +64,16 @@
 ### 开发逻辑点
 - **盲盘控制 (Blind Count)**: 
     - 开发者需在 UI 或 PDA 接口中增加 `Is_Blind_Count` 参数。
-    - **逻辑**: 如果开启，移动端严禁显示 `Snapshot_Qty`，强制录入人员实地清点。
-- **二次复核**: 
-    - 当 `ABS(实盘 - 账面) > 阈值` 时，开发者需自动触发 `Re-count_Task`。
+- **并发安全性**:
+    - **PG 实现建议**: 在执行差异过账时，使用 **`SELECT ... FOR UPDATE`** 锁定 `inventory_balance` 相关行，防止在记账瞬间发生并行的收发货事务导致数据失准。
+- **审计追踪**:
+    - **PG 实现建议**: 利用 PostgreSQL 的 **`Trigger`** 自动记录盘点单状态变更历史到 `audit_log` 表中，记录 `OLD` 和 `NEW` 值的差异。
 
 ---
 
 ## 5. 开发者 Checklist
 
-- [ ] **多货位/多批次**: 盘点记录是否能精细到 `Sub_Location` 和 `Lot_Number`？
+- [ ] **多租户数据隔离**: 是否已配置 **RLS (Row-Level Security)** 确保不同组织的盘点单物理隔离？
+- [ ] **数值精度**: 盘点差异计算是否统一使用 **`numeric`** 类型以避免浮点数精度丢失？
 - [ ] **PDA 集成**: 接口是否支持连续扫描条码并自动累加实盘数量？
-- [ ] **事务并发**: 盘点差异过账时，是否对库存行执行了排他锁？
 - [ ] **历史追溯**: 是否保存了盘点前的原始快照和盘点后的修正轨迹？

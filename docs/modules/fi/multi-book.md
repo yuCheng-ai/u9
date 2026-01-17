@@ -16,6 +16,10 @@
     - **调整账簿 (Adjustment Ledger)**: 仅记录不同准则之间的“差异分录”。
 - **虚拟账簿视图**: 开发者在写查询 SQL 时，必须实现“视图合并”：`GAAP 报表 = 主账簿数据 + 对应 GAAP 的调整账簿数据`。
 
+### PostgreSQL 实现建议
+- **物化视图与实时合并**: 使用 `UNION ALL` 结合 `VIEW` 实现主账簿与调整账簿的合并查询。对于报表展示，可以使用 `MATERIALIZED VIEW` 预计算合并结果，并配合 `REFRESH MATERIALIZED VIEW CONCURRENTLY` 实现无锁刷新。
+- **行级安全策略 (RLS)**: 对 `ledger_entry` 表应用 RLS，确保不同准则的审计人员只能看到其对应账簿的数据。
+
 ---
 
 ## 2. 差异核算逻辑 (Difference Accounting)
@@ -30,6 +34,10 @@
     - 路由 B（IFRS 账簿）：`借：无形资产，贷：原材料`。
 - **差异同步**: 开发者需确保当业务单据被弃审时，所有关联账簿中的凭证必须**同步冲销**。
 
+### PostgreSQL 实现建议
+- **触发器联动**: 在 `ledger_primary` 表上设置 `AFTER DELETE` 或 `AFTER UPDATE` 触发器，自动同步删除或更新关联账簿中的凭证，确保数据的强一致性。
+- **JSONB 存储原始数据**: 在凭证行中使用 `JSONB` 存储业务单据的原始上下文，方便在不同准则下进行二次核算和差异追溯。
+
 ---
 
 ## 3. 多本位币与折算 (Currency Translation)
@@ -43,7 +51,17 @@
     - 损益类科目：按期间平均汇率折算。
     - 资产负债类科目：按期末即期汇率折算。
     - 实收资本：按历史汇率折算。
-- **FCTR (外币报表折算差额)**: 开发者必须处理折算后的借贷不平问题，将差额自动挤入 `FCTR` 科目。
+- **FCTR (外币报表折算差额)**: 开发者必须 handle 折算后的借贷不平问题，将差额自动挤入 `FCTR` 科目。
+
+### PostgreSQL 实现建议
+- **自定义聚合函数**: 编写自定义聚合函数处理折算差额，利用 `SType` 在聚合过程中实时计算 FCTR。
+- **窗口函数计算平均汇率**: 
+  ```sql
+  SELECT currency_code, 
+         AVG(rate) OVER(PARTITION BY currency_code, date_trunc('month', rate_date)) as avg_monthly_rate
+  FROM exchange_rates;
+  ```
+- **分区存储**: 折算数据通常量级巨大，建议按 `ledger_id` 进行列表分区（List Partitioning），提升跨账簿查询性能。
 
 ---
 
@@ -55,6 +73,11 @@
 ### 开发逻辑点
 - **分布式事务/补偿机制**: 在 AEP 抛送多账簿时，必须使用强一致性事务。如果其中一个账簿写入失败，整个业务单据的财务状态必须回滚为“待入账”。
 - **流水号隔离**: 不同账簿的凭证流水号（Voucher Number）必须独立维护，严禁共用。
+
+### PostgreSQL 实现建议
+- **保存点 (SAVEPOINT)**: 在抛送多账簿凭证的 `PL/pgSQL` 过程中使用 `SAVEPOINT`，实现局部事务失败时的精准回滚。
+- **序列号 (SEQUENCE) 隔离**: 为每个账簿创建独立的 `SEQUENCE` 对象：`CREATE SEQUENCE voucher_seq_cas`, `CREATE SEQUENCE voucher_seq_ifrs`，确保流水号生成的原子性与独立性。
+- **咨询锁 (Advisory Locks)**: 在凭证过账期间，使用 `pg_advisory_xact_lock(business_doc_id)` 确保同一笔业务单据不会被多次并发抛送。
 
 ---
 

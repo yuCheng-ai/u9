@@ -19,6 +19,15 @@ ERP 不再是一个孤岛。云服务集成是 ERP 的“外交官”，负责�
 - **电子档案存储**: 
     - 开发者需实现一个 `PDF_Downloader`，将税局返回的电子发票 PDF 自动挂载到 ERP 的单据附件中。
 
+### PostgreSQL 实现建议
+- **JSONB 构造与解析**: 利用 PG 的 `jsonb_build_object` 函数直接在 SQL 层构造发票请求报文，并利用 `JSONB` 字段存储税局返回的完整原始响应，方便后期排查审计。
+- **NOTIFY/LISTEN 异步触发**: 结算单审核后发出 `NOTIFY invoice_request`，后台任务捕获通知并执行云开票逻辑，实现业务与集成的物理隔离。
+- **触发器维护状态**: 
+  ```sql
+  CREATE TRIGGER update_invoice_status AFTER UPDATE OF invoice_no ON ar_invoice
+  FOR EACH ROW EXECUTE FUNCTION log_invoice_event();
+  ```
+
 ---
 
 ## 2. 友云采：数字化采购协同 (Supplier Collaboration)
@@ -32,6 +41,11 @@ ERP 不再是一个孤岛。云服务集成是 ERP 的“外交官”，负责�
     - **云端 -> ERP**: 供应商在平台填写的 ASN（送货通知），自动在 ERP 生成 `ASN_Document`。
 - **身份联邦 (SSO)**: 
     - 开发者需实现 OAuth2 或 OpenID 协议，确保企业用户从 ERP 点击按钮即可免密跳转到云采购平台。
+
+### PostgreSQL 实现建议
+- **外部数据源 (postgres_fdw)**: 如果云端中间库也是 PostgreSQL，可以使用 `postgres_fdw` 将其映射为本地外部表，像操作本地数据一样同步 ASN 信息。
+- **行级安全策略 (RLS)**: 在同步表中应用 RLS，确保不同供应商的数据在数据库层实现逻辑隔离，防止越权访问。
+- **GIN 索引优化**: 对存储 ASN 详情的 `JSONB` 字段建立 `GIN` 索引，加速对物料号、批次等关键信息的检索。
 
 ---
 
@@ -48,6 +62,18 @@ ERP 不再是一个孤岛。云服务集成是 ERP 的“外交官”，负责�
     - 开发者需实现“指数退避”重试逻辑（1s, 2s, 4s...），处理暂时的网络抖动。
 - **幂等校验 (Idempotency)**: 
     - 每一个上云的单据必须携带全局唯一的 `Request_ID`，防止网络重试导致云端产生重复记录。
+
+### PostgreSQL 实现建议
+- **SKIP LOCKED 并发处理**: 
+  ```sql
+  SELECT * FROM cloud_outbox 
+  WHERE status = 'Pending' 
+  FOR UPDATE SKIP LOCKED 
+  LIMIT 10;
+  ```
+  多个后台 Worker 进程使用 `SKIP LOCKED` 语法并行抓取待发送任务，既能保证任务不重复，又能实现极高的吞吐量。
+- **自定义序列号 (UUID)**: 强制使用 `UUID` 作为 `Request_ID`，并利用 PG 原生的 `uuid` 类型存储，确保全局唯一性。
+- **pg_cron 定时重试**: 利用 `pg_cron` 插件定期扫描发送失败且未达到最大重试次数的任务，自动触发重试流程。
 
 ---
 

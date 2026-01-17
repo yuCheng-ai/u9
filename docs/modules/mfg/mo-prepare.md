@@ -18,6 +18,11 @@
     - **开发注意**: 必须处理“半齐套”状态（如：缺 1 个零件，齐套率 99%）。
 - **结果持久化**: 将齐套分析结果存入 `Kitting_Result_Table`，供车间主管决定是否下达生产。
 
+### PostgreSQL 实现建议
+- **窗口函数预排序**: 利用 `DENSE_RANK()` 或 `ROW_NUMBER()` 在数据库层完成复杂因子的初步排序，减轻应用层压力。
+- **CTE 递归齐套**: 若存在多级子件，使用 `WITH RECURSIVE` 展开 BOM 并结合 `inventory` 表计算每一级的齐套情况。
+- **咨询锁 (Advisory Locks)**: 在进行齐套分析期间，对特定物料或仓库使用 `pg_advisory_xact_lock(item_id)`，防止多个齐套任务同时抢占同一批库存。
+
 ---
 
 ## 2. 领料模式的逻辑实现 (Issue Modes)
@@ -34,6 +39,11 @@
     - **逻辑点**: 在“完工汇报”事务完成后，异步触发一个 `Backflush_Job`，根据 BOM 用量自动扣减线边仓库存。
     - **异常处理**: 如果线边仓库存不足，开发者需将该任务挂起并通知人工补料。
 
+### PostgreSQL 实现建议
+- **LISTEN/NOTIFY 异步驱动**: 完工申报后发出 `NOTIFY mo_complete_channel, 'MO_ID_123'`，后台 Worker 进程 `LISTEN` 并触发倒冲逻辑，实现业务解耦。
+- **触发器强制约束**: 在领料单明细表上设置 `CHECK` 约束或 `BEFORE INSERT` 触发器，确保 `issued_qty` 不超过 `required_qty`（除非有超领审批标记）。
+- **批量处理**: 使用 `UNNEST` 函数一次性传入多个领料行，减少与数据库的交互往返次数。
+
 ---
 
 ## 3. 线边仓与在制品 (WIP Inventory)
@@ -46,6 +56,11 @@
 - **资产权属**: 开发者需确保在线边仓中，物料仍然带有 `ProjectID` 或 `MOID` 标识。
 - **盘点逻辑**: 线边仓的盘点差异需自动计入“制造费用 - 物料损耗”。
 
+### PostgreSQL 实现建议
+- **复合索引优化**: 在 `inventory_balance` 表上建立 `(warehouse_id, item_id, project_id, mo_id)` 的复合索引，加速线边仓精准查询。
+- **JSONB 扩展属性**: 利用 `JSONB` 字段存储非核心的业务标识（如：工位号、班组），避免频繁修改表结构。
+- **存储过程封装**: 将调拨逻辑（减少 A 库、增加 B 库、写入流水）封装在 `PL/pgSQL` 函数中，确保 ACID 特性。
+
 ---
 
 ## 4. 超领控制与成本归集 (Over-issue Control)
@@ -56,6 +71,14 @@
 ### 开发逻辑点
 - **审批工作流**: 开发者需在 `Material_Issue` API 中增加拦截：`IF (Current_Qty > Required_Qty) THEN 强制要求关联 Over_Issue_Form_ID`。
 - **成本标记**: 超领的物料需被打上“异常损耗”标签，以便在 FI（财务）模块进行成本核算时，不计入标准产品价值，而是直接计入当期损益。
+
+### PostgreSQL 实现建议
+- **视图区分标准与异常**: 创建 `v_mo_material_cost` 视图，使用 `CASE WHEN` 自动区分 `standard_cost` 和 `variance_cost`（超领部分）。
+- **部分索引 (Partial Index)**: 
+  ```sql
+  CREATE INDEX idx_over_issue ON material_issue (mo_id) WHERE is_over_issue = TRUE;
+  ```
+  方便财务快速检索所有超领记录进行月度分析。
 
 ---
 

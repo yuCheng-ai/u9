@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
+  base: '/u9/',
   title: "自研 ERP 产品规格文档",
   description: "对标 U9 的自研 ERP 产品细节与业务逻辑指南",
   themeConfig: {

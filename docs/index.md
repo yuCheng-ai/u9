@@ -6,12 +6,13 @@
 - [核心业务架构与多组织逻辑](./guide/introduction.md)
 
 ## 业务模块详情
-- [CBO 基础设置](./modules/cbo.md) - 料品、组织、合作伙伴等主数据。
-- [SCM 供应链管理](./modules/scm.md) - 采购、销售、库存、质检。
-- [MFG 生产制造](./modules/mfg.md) - BOM、MRP、生产订单、车间。
-- [FI 财务管理](./modules/fi.md) - 总账、报表、应收应付、固定资产。
-- [COST 成本管理](./modules/cost.md) - 成本域、实际成本核算。
-- [PBM 项目制造](./modules/pbm.md) - 针对项目型企业的专项方案。
+- [CBO 基础设置](./modules/cbo/common-base.md) - 料品、组织、合作伙伴等主数据。
+- [SCM 供应链管理](./modules/scm/sales-process.md) - 采购、销售、库存、质检。
+- [MFG 生产制造](./modules/mfg/bom-manage.md) - BOM、MRP、生产订单、车间。
+- [FI 财务管理](./modules/fi/gl-ar-ap.md) - 总账、报表、应收应付、固定资产。
+- [COST 成本管理](./modules/fi/cost-std.md) - 成本域、实际成本核算。
+- [PBM 项目制造](./modules/feature/pjm.md) - 针对项目型企业的专项方案。
+- [SYS 系统管理](./modules/sys/uap.md) - 平台、集成、云服务。
 
 ## 设计目标
 1. **多组织协同**：支持复杂的集团化、全球化经营。

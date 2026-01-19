@@ -66,14 +66,14 @@
 ### PostgreSQL 实现建议
 - **触发器联动**: 在工序流转表上设置 `AFTER UPDATE` 触发器，当委外工序状态变为“待发出”时，自动向 `purchase_request` 表插入记录。
 - **JSONB 记录物流轨迹**: 
-  ```jsonb
-  {
-    "subcontractor": "Vendor_A",
-    "shipped_at": "2023-10-01",
-    "expected_back": "2023-10-05",
-    "tracking_no": "SF123456"
-  }
-  ```
+  ```json
+{
+  "subcontractor": "Vendor_A",
+  "shipped_at": "2023-10-01",
+  "expected_back": "2023-10-05",
+  "tracking_no": "SF123456"
+}
+```
   利用 `JSONB` 存储动态的外协物流信息，无需为每种外协业务修改表结构。
 - **外部数据源 (postgres_fdw)**: 如果委外商使用了独立的协作系统，可以通过 `postgres_fdw` 直接在 ERP 中查询外协进度。
 

@@ -5,68 +5,104 @@
 
 ---
 
-## 1. 取价引擎算法 (Pricing Search Engine)
+## 业务痛点与开发对策
 
-### 企业痛点
-**“客户抱怨我给他的价格比上个月贵了，销售员说他记错了，系统里也没个自动取价逻辑”**。
-
-### 开发逻辑点
-- **瀑布式搜索策略 (Waterfall Search)**: 
-    - 开发者需实现一个可配置的搜索链条。
-    - **PG 实现建议**: 使用 **CTE (Common Table Expressions)** 构建层级搜索查询，结合 **`UNION ALL`** 和 **`LIMIT 1`** 实现具有优先级的“熔断”取价逻辑。
-- **日期与状态校验**: 
-    - 接口必须校验价格的有效性。
-    - **PG 实现建议**: 使用 **`daterange`** 类型存储价表有效期，并利用 **`GIST` 索引** 实现毫秒级的日期重叠与包含查询。
+| 业务痛点 | 技术对策 |
+| :--- | :--- |
+| **价格记忆混乱**：同一个客户，销售员录入的价格每次都不一样，缺乏基准。 | **瀑布式取价引擎 (Waterfall Engine)**：实现一套基于优先级（客户特价 > 客户等级价 > 全局标准价）的自动寻价逻辑，利用 `UNION ALL` + `LIMIT 1` 确保性能。 |
+| **量大从优难以落地**：阶梯价计算复杂，录单员手动算容易出错。 | **Range 区间匹配**：利用 PostgreSQL 的 `numrange` 实现阶梯区间的秒级检索，避免繁琐的 `IF-ELSE` 逻辑。 |
+| **折扣“罗生门”**：多种促销折扣叠加（满减、折上折），财务核算困难。 | **折扣栈 (Discount Stack)**：定义严格的计算序列（减法 -> 比例 -> 取整），并利用 JSONB 记录完整的“折扣分摊足迹”。 |
+| **亏本卖货风险**：销售为保单随意降价，缺乏底线拦截。 | **最低限价硬拦截**：在单据 `BeforeSave` 钩子中，强制校验 `ActualPrice < Cost * (1 + MinMargin)`，非授权禁止通过。 |
 
 ---
 
-## 2. 阶梯价格与批量计算 (Volume Tiering)
+## 1. 取价引擎算法 (Waterfall Search)
 
-### 企业痛点
-“买 1 个和买 1000 个的价格是不一样的，开发者如果处理不好，销售员录单时得手动计算，效率极低”。
+### 业务场景
+系统需根据“客户、料品、数量、日期、币种”自动从成千上万条价格记录中找到那唯一正确的价格。
 
-### 开发算法
-- **区间查找算法**: 
-    - 开发者需维护 `Price_Break` 表。
-    - **PG 实现建议**: 使用 **`numrange`** 类型存储数量区间，通过 `@>` 操作符直接定位订单数量所在的阶梯。
-- **阶梯模式支持**: 
-    - **全额阶梯**: 全部按某一单价。
-    - **超额阶梯**: 类似个税的分段计算。
-    - **PG 实现建议**: 利用 **窗口函数 (Window Functions)** 计算分段累计金额，避免在应用层进行复杂的循环累加逻辑。
+### 开发逻辑：优先级匹配
+开发者需实现一个寻价链条，优先级由高到低：
+1. **特价协议**: `Customer_ID + Item_ID` 唯一匹配。
+2. **客户等级价**: `Customer_Grade + Item_ID` 匹配。
+3. **全局基准价**: `Item_ID` 匹配。
+
+### 技术实现建议
+- **GIST 索引**: 对于包含有效期的价格表，务必对 `(item_id, validity_period)` 建立 GIST 索引。
+- **示例代码**:
+  ```sql
+  -- 高效取价逻辑
+  WITH price_candidates AS (
+      -- 优先级 10：客户特价
+      SELECT unit_price, 10 as priority FROM sal_price_special 
+      WHERE customer_id = :cust AND item_id = :item AND validity @> :order_date
+      UNION ALL
+      -- 优先级 20：等级价
+      SELECT unit_price, 20 as priority FROM sal_price_grade 
+      WHERE grade_id = :grade AND item_id = :item AND validity @> :order_date
+      UNION ALL
+      -- 优先级 30：基准价
+      SELECT unit_price, 30 as priority FROM sal_price_standard 
+      WHERE item_id = :item AND validity @> :order_date
+  )
+  SELECT unit_price FROM price_candidates ORDER BY priority ASC LIMIT 1;
+  ```
 
 ---
 
-## 3. 多重折扣叠加逻辑 (Discount Stacking)
+## 2. 阶梯价格与区间查找 (Volume Tiering)
 
-### 企业痛点
-**“又有节日折扣 9 折，又有会员折扣 95 折，到底是 85 折还是 85.5 折？”**。
+### 业务场景
+“1-99 个：10元；100-499 个：9.5元；500个以上：9元”。
 
-### 开发逻辑点
-- **折扣类型定义**: 
-    - `Additive` (相加)、`Compounded` (相乘)。
-- **折扣序列 (Discount Sequence)**: 
-    - 开发者需确保计算顺序的一致性。
-    - **PG 实现建议**: 使用 **数组聚合 (`array_agg`)** 收集所有生效折扣，并在自定义函数中使用 **PL/pgSQL** 按照业务规则（如：先算加法折扣，再算乘法折扣）进行精确计算。
+### 技术实现建议
+- **避免多行 Join**: 将阶梯区间存储为 `numrange`。
+- **示例代码**:
+  ```sql
+  -- 利用 @> 操作符秒级匹配数量区间
+  SELECT tiered_price FROM sal_price_tier 
+  WHERE price_list_id = :id 
+    AND qty_range @> :current_qty; -- 例如 [100, 500) @> 250
+  ```
 
 ---
 
-## 4. 价格强控与最低限价 (Price Ceiling/Floor)
+## 3. 折扣叠加与足迹追踪 (Discount Stacking)
 
-### 企业痛点
-“销售为了拿提成，故意把价格压得很低，结果公司亏本卖货”。
+### 业务场景
+一个订单可能同时应用：渠道折扣（95折）、限时立减（-10元）、新客返利（2%）。
 
-### 开发逻辑点
-- **底线校验**: 
-    - 开发者需在 SO 审核 API 中强制接入校验。
-    - **PG 实现建议**: 使用 **`CHECK` 约束** 结合自定义函数实现数据库层级的最低价拦截。
-- **动态审批流触发**:
-    - **PG 实现建议**: 利用 **`NOTIFY / LISTEN`** 机制。当价格偏离度超过阈值时，自动触发异步审批工作流，提高系统吞吐量。
+### 开发规范
+- **折扣序列化**: 必须在数据库中定义 `discount_sequence`（如：10-减法，20-比例）。
+- **足迹存储**: 在订单行中使用 JSONB 记录应用过程：`[{"type": "minus", "val": 10}, {"type": "ratio", "val": 0.95}]`。
+- **精度控制**: 每一层折扣计算后的中间值必须使用 `ROUND(val, 4)` 或更高精度。
+
+---
+
+## 4. 价格硬拦截与审计 (Price Guard)
+
+### 业务场景
+防止销售人员由于误操作或恶意竞争，以低于成本的价格销售。
+
+### 技术实现建议
+- **动态底价**: 底价 = `最新入库成本 * (1 + 利润率参数)`。
+- **授权重写**: 如果确实需要亏本销售，必须关联一个“特批流程 ID (Workflow_ID)”。
+- **示例代码**:
+  ```sql
+  -- 触发器中的底价校验
+  IF (NEW.unit_price < (SELECT min_allowed_price FROM v_item_cost WHERE id = NEW.item_id)) 
+     AND (NEW.special_approve_id IS NULL) THEN
+      RAISE EXCEPTION 'ERR_PRICE_VIOLATION: 成交价低于系统底线且未经过特批';
+  END IF;
+  ```
 
 ---
 
 ## 5. 开发者 Checklist
 
-- [ ] **高精度计算**: 所有的单价、折扣、总额计算是否统一使用 **`numeric`** 类型？
-- [ ] **多租户隔离**: 是否通过 **RLS** 确保不同分公司的价格政策物理隔离？
-- [ ] **性能优化**: 是否对常用的 `(item_id, customer_id, validity_range)` 组合建立了索引？
-- [ ] **审计记录**: 是否利用 **`JSONB`** 记录了每次自动取价的“计算足迹”（即：为何取了 A 价而不是 B 价）？
+- [ ] **数值精度**: 所有的单价、折扣、总额计算是否统一使用 `numeric(24, 12)`？
+- [ ] **寻价性能**: 价格表记录过万时，是否通过 GIST 索引优化了日期范围检索？
+- [ ] **重定价触发**: 订单日期、客户、数量发生变化时，是否触发了“自动重新寻价”？
+- [ ] **手动改价标记**: 如果用户手动修改了自动取出的价格，是否在 `price_source` 标记为 `Manual`？
+- [ ] **币种汇率**: 价格表币种与订单币种不一致时，是否正确应用了 `TransRate` 进行折算？
+- [ ] **缓存策略**: 对于频繁读取的全局基准价，是否考虑在应用层缓存或使用 PostgreSQL 的 `Materialized View`？

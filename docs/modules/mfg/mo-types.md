@@ -5,22 +5,31 @@
 
 ---
 
-## 1. 订单类型与逻辑路由 (MO Types & Routing)
+## 1. 订单类型、版本化与委外损耗管理 (MO Types & Revision)
 
 ### 企业痛点
-**“返工领的料全算进了标准成本，导致成本分析全乱了”**。
+- **成本隔离**: “返工领的料全算进了标准成本，导致分析全乱了”。
+- **变更追溯**: “MO 已经发给车间了，突然改了 BOM，车间却不知道改了什么”。
 
 ### 开发逻辑点
-- **类型路由**: 开发者需通过 `MO_Type` 驱动不同的业务逻辑。
-    - **标准订单**: 严格校验 BOM，自动生成领料明细。
-    - **返工订单**: 允许空 BOM 启动，支持手动录入 `Rework_Material`。
-    - **改制订单**: 需处理“旧品退库”与“新品入库”的价值转换。
-- **成本隔离**: 开发者在设计数据库索引时，必须确保 `Cost_Center` 和 `MO_Type` 是核心查询维度，防止不同类型的订单成本混淆。
+- **类型路由**: 开发者需通过 `MO_Type` 驱动逻辑。
+- **全量版本化 (Full Versioning)**: 生产订单 (MO) 必须支持版本追踪。变更即升版，旧快照存入 `mo_history`。
+- **委外损耗与所有权处置**: 
+    - 开发者需提供 `Subcontract_Scrap_Report` 接口。
+    - **逻辑**: `委外商库存 = 发出量 - 完工扣料量 - 报损量`。
+    - **所有权处置策略 (Ownership Policy)**: 
+        - **实物退回 (Physical Return)**: 损耗/余料必须实物退回到企业的“委外损耗仓”。
+        - **金额扣减 (Cost Offset)**: 经审批后，损耗直接折算为金额，从支付给委外商的加工费中扣除。
+- **成本隔离**: 确保 `Cost_Center` 和 `MO_Type` 是核心查询维度。
 
 ### PostgreSQL 实现建议
-- **枚举类型 (ENUM)**: 使用 `CREATE TYPE mo_type AS ENUM ('Standard', 'Rework', 'Refurbish')` 提高数据存储效率和可读性，并配合 `CHECK` 约束实现业务逻辑分支。
-- **部分索引 (Partial Index)**: 针对不同类型的订单创建部分索引，例如：`CREATE INDEX idx_rework_mo ON mo_header (id) WHERE mo_type = 'Rework'`，加速特定业务场景的检索。
-- **视图解耦**: 创建 `v_standard_mo`, `v_rework_mo` 等视图，将不同类型订单的特有逻辑封装在视图中，简化应用层开发。
+- **JSONB 记录委外属性与快照**: 存储委外商 ID、预计回收率、以及审核时的 `mo_history` 快照。
+- **示例代码**:
+  ```sql
+  -- 记录 MO 变更历史
+  INSERT INTO mo_history (mo_id, version, snapshot)
+  SELECT id, version, to_jsonb(mo_header.*) FROM mo_header WHERE id = :id;
+  ```
 
 ---
 

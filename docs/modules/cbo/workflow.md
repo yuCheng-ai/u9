@@ -69,23 +69,33 @@
 
 ---
 
-## 4. 严谨性校验：反审核与幂等 (Consistency)
+## 4. 严谨性校验：反审核与全链路弃审 (Consistency)
 
 ### 业务场景
-用户误操作或撤回申请。系统必须能够安全地执行“反审核”逻辑，并防止重复点击导致的幂等性问题。
+- **幂等性**: 防止重复点击导致的多次审批执行。
+- **全链路弃审 (Un-approve)**: 当单据已产生下游业务（如销售订单已生成发货单）时，系统需支持“一键反审核”或“逆序弃审”。
 
 ### 开发规范
-- **反审核链条检查**: 弃审时必须检查下游是否有已执行单据。若有，则必须先弃审下游，防止业务逻辑断层。
+- **逆序依赖检查**: 
+    - 严禁直接修改单据状态。
+    - 弃审时必须递归检查所有下游单据的状态。如果下游单据已审核或已执行，必须先弃审下游，否则拦截操作。
 - **幂等设计**: 所有的审批操作必须携带唯一 `RequestID` 或 `Version` 标识。
-- **技术实现建议**: 
-    - **乐观锁控制**: 每一条单据增加 `version` 字段，更新状态时必须执行 `WHERE version = :old_version`。
-    - **日志钩子**: 利用数据库 **Trigger (触发器)** 自动记录操作日志，确保审计信息的生成与业务逻辑在同一个原子事务中。
-    - **示例代码**:
-      ```sql
-      -- 使用版本号防止并发冲突
-      UPDATE sales_order SET status = 'Draft', version = version + 1 
-      WHERE id = :id AND version = :old_version;
-      ```
+
+### 技术实现建议
+- **递归依赖探测**: 利用数据库视图或专门的 `doc_links` 表记录单据溯源关系。
+- **原子性操作**: 整个弃审链条必须在一个分布式事务（或 Saga 模式）中完成。
+- **示例代码**:
+  ```sql
+  -- 递归检查下游单据是否可弃审
+  WITH RECURSIVE downstream_docs AS (
+      SELECT target_id, target_type, status FROM doc_links WHERE source_id = :current_id
+      UNION ALL
+      SELECT l.target_id, l.target_type, l.status FROM doc_links l 
+      JOIN downstream_docs d ON l.source_id = d.target_id
+  )
+  SELECT count(*) FROM downstream_docs WHERE status NOT IN ('Draft', 'Cancelled');
+  -- 如果 count > 0，则禁止弃审当前单据
+  ```
 
 ---
 

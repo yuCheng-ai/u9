@@ -26,30 +26,28 @@
 
 ---
 
-## 2. 工作中心与资源能力 (Work Center & Capacity)
+## 2. 工作中心与共享资源冲突 (Work Center & Shared Resources)
 
 ### 企业痛点
-“明明只有 3 台机器，系统却排了 5 个人的活，导致现场大乱”。
+- **能力建模 (Capacity)**: “明明只有 3 台机器，系统却排了 5 个人的活”。
+- **共享资源冲突**: 当多个工作中心共用同一台关键设备（如大型烘箱）时，排程算法如何处理资源抢占？
 
 ### 开发逻辑点
-- **能力建模 (Capacity)**: 
-    - 开发者需维护 `Work_Center_Resource` 表。
-    - **逻辑**: `Daily_Capacity = 资源数量 * 班次工时 * 效率系数`。
+- **资源抽象**: 设备应作为独立资源（Resource）被多个工作中心引用。
 - **有限能力校验 (Finite Capacity)**: 
-    - 在排产接口中，开发者需增加“超载拦截”或“自动顺延”逻辑。
-    - **算法**: `Next_Available_Start_Date = MAX(Resource_Busy_Until, Material_Ready_Date)`。
+    - 在排产接口中，开发者需增加“超载拦截”逻辑。
+    - **排程算法**: `Next_Available_Start_Date = MAX(Resource_Busy_Until, Material_Ready_Date)`。
 
 ### PostgreSQL 实现建议
-- **GIST 索引与排除约束**: 
+- **GIST 索引与排除约束 (Exclusion Constraints)**: 
   ```sql
+  -- 强制设备资源在时间轴上不重叠
   ALTER TABLE resource_allocation ADD EXCLUDE USING gist (
     resource_id WITH =,
     busy_period WITH &&
   );
   ```
-  利用排除约束（Exclusion Constraints）确保同一资源在同一时间段内不会被重叠占用。
-- **窗口函数计算负载**: 使用 `SUM(allocated_hours) OVER(PARTITION BY resource_id ORDER BY date)` 实时计算资源的滚动负荷，识别瓶颈工序。
-- **UNLOGGED TABLE 性能优化**: 排产模拟过程中的临时负载计算可以使用 `UNLOGGED TABLE`，减少磁盘 I/O，大幅提升计算速度。
+- **咨询锁 (Advisory Locks)**: 在进行高频排产模拟时，利用 `pg_try_advisory_lock` 快速锁定资源，防止并发排程冲突。
 
 ---
 

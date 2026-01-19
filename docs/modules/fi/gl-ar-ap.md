@@ -1,95 +1,116 @@
 # 财务基础 (GL/AR/AP) - 开发者详尽指南
 
 ## 概述
-财务模块是 ERP 的“真值来源”。在开发视角下，财务是对业务数据的**合规化映射与多维汇总**。开发者必须利用 PostgreSQL 的**强一致性事务**、**行级安全策略 (RLS)** 和**高精度数值类型**，确保业务单据（Sub-ledger）与总账（General Ledger）之间的绝对同步与数据防篡改。
+财务模块是 ERP 的“真值来源”。在开发视角下，财务是对业务数据的**合规化映射与多维汇总**。开发者必须利用 PostgreSQL 的**强一致性事务**、**行级安全策略 (RLS)** 和**高精度数值类型**，确保业务单据（Sub-ledger）与总账（General Ledger）之间的绝对同步。
 
 ---
 
-## 1. 总账 (GL) 与自动会计平台 (AEP)
+## 业务痛点与开发对策
+
+| 业务痛点 | 技术对策 |
+| :--- | :--- |
+| **业财脱节**：业务单据审核了，但财务不知道，或者凭证科目选错了。 | **AEP 映射引擎 (AEP_Engine)**：利用 JSONB 存储入账规则，在业务审核事务中“同步生成”或“异步抛送”凭证。 |
+| **核销混乱**：一笔收款分多次核销多张发票，余额算错，导致客户投诉。 | **原子核销模型 (Atomic_Clearing)**：使用 `fi_clearing_detail` 中间表记录每一笔核销足迹，并在 `SERIALIZABLE` 隔离级别下更新余额。 |
+| **关账后乱改数据**：财务月结已完成，业务却在修改上个月的单据，导致报表不平。 | **期间硬拦截 (Period_Lock)**：在全局 `BeforeUpdate` 触发器中，强制校验单据日期所属期间的 `is_closed` 状态。 |
+| **数据被篡改**：已过账凭证被开发人员通过后台修改，审计失败。 | **RLS 防篡改策略**：利用 Row Level Security，对 `is_posted = true` 的凭证行禁止任何 `UPDATE/DELETE` 操作。 |
+
+---
+
+## 1. 总账 (GL) 与 AEP 规则匹配
 
 ### 业务场景
-“业务一小步，财务一大步”。业务单据审核后，系统必须根据复杂的入账规则自动生成会计分录。
+销售出库单审核后，需自动生成：`借：主营业务成本，贷：库存商品`。
 
 ### 技术实现建议
-    - **事件捕获**: 利用 PostgreSQL 的 **Logical Decoding** 监听业务单据状态位（如 `status = 'Approved'`），异步触发 AEP 服务。
-    - **规则存储**: 使用 `JSONB` 存储复杂的入账映射规则，利用 `jsonb_path_query` 快速匹配最符合条件的会计科目。
-    - **示例代码**:
-      ```sql
-      -- 使用 jsonb_path_query 匹配入账规则
-      SELECT account_id FROM accounting_rules 
-      WHERE rules @> '{"item_category": "Electronics"}'::jsonb 
-        AND jsonb_path_exists(rules, '$.customer_ranks[*] ? (@ == "VIP")');
-      ```
+- **规则检索**: 使用 `jsonb_path_query` 快速定位科目。
+- **示例代码**:
+  ```sql
+  -- 根据业务属性匹配科目
+  SELECT account_id FROM acc_mapping_rules 
+  WHERE event_type = 'Sales_Issue' 
+    AND rule_json @@ '$.item_group == "Electronics" && $.org_id == 100';
+  ```
 
 ---
 
-## 2. 应收 (AR) 与 应付 (AP) 的精密核销 (Clearing)
+## 2. 精密核销与余额回写 (Clearing Logic)
 
 ### 业务场景
-处理 1:N、N:1 或 N:M 的收付款与发票对账，并精确回写未核销余额。
+客户付了 10,000 元，其中 5,000 核销发票 A，3,000 核销发票 B，2,000 留作预收。
 
 ### 开发规范
-- **核销原子性**: 收付款与发票的核销必须在同一个数据库事务中完成。
-- **余额一致性**: 发票的“待核销金额”必须与明细表的累加值严格相等。
-- **技术实现建议**: 
-    - **并发控制**: 使用 **SERIALIZABLE (可序列化)** 事务隔离级别处理核销逻辑，从根本上杜绝在高并发收付款场景下的余额计算偏差。
-    - **实时对账视图**: 利用 **Window Functions (窗口函数)** 构建实时余额分析模型，通过 `SUM(clearing_amt) OVER (PARTITION BY invoice_id)` 动态呈现每张发票的核销进度。
-    - **示例代码**:
-      ```sql
-      -- 计算发票的实时余额
-      SELECT 
-          invoice_id, amount,
-          amount - SUM(clearing_amount) OVER (PARTITION BY invoice_id) as remaining_balance
-      FROM fi_ar_clearing_details;
-      ```
+- **禁止直接改余额**: 余额必须通过核销明细表（Detail）累加得出。
+- **一致性锁**: 核销时必须同时锁定“发票行”和“收款行”。
+- **示例代码**:
+  ```sql
+  -- 原子核销事务
+  BEGIN;
+  -- 1. 锁定发票与收款记录
+  SELECT id FROM fi_invoice WHERE id = :inv_id FOR UPDATE;
+  SELECT id FROM fi_payment WHERE id = :pay_id FOR UPDATE;
+
+  -- 2. 插入核销明细
+  INSERT INTO fi_clearing_detail (inv_id, pay_id, amount) VALUES (:inv_id, :pay_id, :amt);
+
+  -- 3. 更新发票未核销余额（利用增量扣减）
+  UPDATE fi_invoice SET open_amount = open_amount - :amt WHERE id = :inv_id;
+  COMMIT;
+  ```
 
 ---
 
-## 3. 跨组织往来与自动对冲 (Inter-Company)
+## 3. 期间控制与防篡改 (Period & Security)
 
 ### 业务场景
-集团内部公司间的买卖行为，需自动生成双方的对等分录。
+确保财务结账后的历史数据绝对安全。
 
-### 开发规范
-- **对等性校验**: 借方组织生成的内部应收，必须与贷方组织生成的内部应付在金额、币种上完全一致。
-- **技术实现建议**: 
-    - **分布式查询**: 若不同组织分布在不同数据库实例，利用 PostgreSQL 的 **postgres_fdw (外部数据包装器)** 实现跨库的对账校验。
-    - **一致性事务**: 利用 **Two-Phase Commit (2PC)** 确保跨组织分录生成要么同时成功，要么同时回滚。
-    - **示例代码**:
-      ```sql
-      -- 创建外部表引用另一个组织的账簿数据
-      CREATE FOREIGN TABLE other_org_ledger (
-          account_id int, debit numeric, credit numeric
-      ) SERVER other_org_db OPTIONS (table_name 'gl_ledger');
-      ```
+### 技术实现建议
+- **期间状态校验**:
+  ```sql
+  -- 触发器：拦截已关账期间的写入
+  CREATE OR REPLACE FUNCTION fn_check_period_status() RETURNS TRIGGER AS $$
+  BEGIN
+    IF EXISTS (SELECT 1 FROM fi_period WHERE period_name = to_char(NEW.doc_date, 'YYYY-MM') AND is_closed = true) THEN
+      RAISE EXCEPTION 'ERR_PERIOD_CLOSED: 该期间已结账，禁止操作';
+    END IF;
+    RETURN NEW;
+  END;
+  $$ LANGUAGE plpgsql;
+  ```
+- **RLS 策略**:
+  ```sql
+  -- 保护已过账凭证
+  ALTER TABLE gl_voucher ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY p_voucher_immutable ON gl_voucher
+  FOR UPDATE USING (is_posted = false); -- 只有未过账的才能修改
+  ```
 
 ---
 
-## 4. 汇兑损益与数值精度 (Exchange & Precision)
+## 4. 汇兑损益与数值精度 (Precision)
 
 ### 业务场景
-期末根据最新汇率对所有外币科目进行调汇，计算汇兑损益。
+外币应收账款在月末按新汇率折算，产生的差异计入损益。
 
 ### 开发规范
-- **高精度计算**: 汇率、本币金额、外币金额必须使用 `numeric`。
-- **数据防篡改**: 凭证一旦过账（Posted），物理记录必须变为只读。
-- **技术实现建议**: 
-    - **数值类型**: 统一使用 `numeric(38, 12)`，确保在全球多币种换算场景下不产生舍入误差。
-    - **只读锁定**: 利用 PostgreSQL 的 **Row Level Security (RLS)**。定义策略：当 `posted_status = true` 时，拒绝任何用户的 `UPDATE` 或 `DELETE` 请求，仅允许通过红字冲销（反向凭证）进行修正。
-    - **示例代码**:
-      ```sql
-      -- 开启 RLS 保护已过账凭证
-      ALTER TABLE gl_voucher ENABLE ROW LEVEL SECURITY;
-      CREATE POLICY voucher_readonly_policy ON gl_voucher
-      FOR UPDATE USING (posted_status = false);
-      ```
+- **数值类型**: 统一使用 `numeric(24, 12)`。
+- **调汇逻辑**: 
+  ```sql
+  -- 计算汇兑损益
+  SELECT 
+    invoice_id,
+    (amount_foreign * :new_rate - amount_local) as exchange_diff
+  FROM fi_ar_invoice WHERE currency_id != :base_currency;
+  ```
 
 ---
 
 ## 5. 开发者 Checklist
 
-- [ ] **平衡校验**: 凭证保存前，数据库层是否通过 **Trigger (触发器)** 强制校验 `SUM(debit) == SUM(credit)`？
-- [ ] **期间保护**: 是否在 `CHECK` 约束中加入了期间状态判断，防止凭证记入已关账期间？
-- [ ] **科目有效性**: 凭证行中的科目 ID 是否配置了外键约束，并校验了“允许过账”标识？
-- [ ] **并发性能**: 对于大规模批处理（如期末自动转账），是否利用了 **Parallel Query** 提升损益类科目的汇总速度？
-- [ ] **审计追踪**: 财务核心表是否利用 `JSONB` 记录了所有字段级别的变更历史（Audit Log）？
+- [ ] **借贷平衡**: 凭证保存时是否强制校验 `SUM(debit) == SUM(credit)`？
+- [ ] **精度对齐**: 业务单据生成的本币金额，是否与凭证行的金额完全一致（分毫不差）？
+- [ ] **期间拦截**: 是否在所有财务单据的 `BeforeSave` 中加入了期间开关校验？
+- [ ] **核销回滚**: 弃审收款单时，是否能同步级联删除核销明细并恢复发票余额？
+- [ ] **审计足迹**: 核心余额表（AR/AP/GL）的变动是否记录了 `source_doc_type` 和 `source_doc_id`？
+- [ ] **多币种**: 涉及外币时，是否同时存储了交易汇率（ExchangeRate）和记账汇率（BookingRate）？
+- [ ] **性能**: 核销明细表数据量大时，是否对 `invoice_id` 和 `payment_id` 建立了复合索引？

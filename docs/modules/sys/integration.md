@@ -49,32 +49,40 @@
 
 ---
 
-## 3. 分布式事务与最终一致性 (Consistency)
+## 3. 分布式事务、最终一致性与可视化监控 (Consistency & Monitor)
 
 ### 企业痛点
-**“MES 显示报工成功了，但 ERP 里单据没生成，导致两边数据对不上”**。
+- **数据失步**: “MES 报工成功，但 ERP 单据未生成”。
+- **不可见性**: 开发者不知道哪些集成任务失败了，只能查日志，效率极低。
 
 ### 开发逻辑点
 - **本地事务表模式 (Transactional Outbox)**: 
     - 开发者在 ERP 执行业务逻辑时，同步在 `Integration_Task` 表插入一条记录。
-    - **逻辑**: 使用后台调度器（Job）轮询该表，确保即使网络中断，任务也会在恢复后继续执行。
-- **补偿事务 (Saga Pattern)**: 
-    - 如果集成调用失败且无法重试，开发者需设计“冲销接口”。
+- **可视化重试机制 (Manual Retry)**: 
+    - 开发者需提供 `Integration_Monitor` 界面。
+    - **功能**: 展示任务状态（成功/失败/重试中）、错误堆栈、原始报文。
+    - **操作**: 支持“手动重试”或“一键冲销（Compensate）”。
+- **补偿事务 (Saga Pattern)**: 如果重试多次失败，执行反向冲销逻辑。
 
 ### PostgreSQL 实现建议
 - **SKIP LOCKED 任务抓取**: 
   ```sql
   WITH task AS (
     SELECT id FROM integration_task 
-    WHERE status = 'Pending' 
+    WHERE status = 'Pending' AND next_retry_at < now()
     FOR UPDATE SKIP LOCKED 
     LIMIT 10
   )
   UPDATE integration_task SET status = 'Processing' FROM task WHERE integration_task.id = task.id;
   ```
-  利用 `SKIP LOCKED` 实现高可靠的任务分发引擎，彻底解决集成过程中的“任务丢失”或“重复执行”问题。
-- **触发器维护审计日志**: 在 `integration_task` 表上设置 `BEFORE UPDATE` 触发器，自动记录每次尝试的重试次数、错误堆栈和耗时。
-- **JSONB 记录补偿数据**: 将执行补偿事务所需的原始参数存储在 `JSONB` 字段中，确保在失败回滚时有足够的信息还原业务状态。
+- **JSONB 记录任务全貌**: 存储 `Request_Payload`、`Response_Payload` 和 `Error_Trace`。
+- **示例代码**:
+  ```sql
+  -- 手动重试：将状态重置为 Pending 并更新重试时间
+  UPDATE integration_task 
+  SET status = 'Pending', retry_count = retry_count + 1, next_retry_at = now()
+  WHERE id = :task_id;
+  ```
 
 ---
 

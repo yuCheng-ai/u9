@@ -27,24 +27,28 @@ MRP（物料需求计划）是 ERP 的“中央处理器”。在开发视角下
 
 ---
 
-## 2. 计划方案与快照隔离 (Simulation & Snapshot)
+## 2. 产能约束与排产方案 (CRP & Simulation)
 
 ### 业务场景
-用户需要运行多个“What-if”方案（如：订单倍增模拟），且不能干扰生产环境。
+- **无限产能 (Infinite Capacity)**: 只考虑物料，假设产能无限。适合计划初期。
+- **有限产能 (Finite Capacity/CRP)**: 必须考虑工作中心（WC）的实际工时约束。
+- **逾期供应处理**: 逾期未收货的采购单（PO）或未完工的生产单（MO），系统是假设明天就能到货，还是自动向后推延？
 
 ### 开发规范
 - **方案隔离**: 所有计算结果必须关联 `Plan_ID`。
-- **静态快照**: 运算开始前，必须抓取物料、BOM、库存和单据的静态快照。
-- **技术实现建议**: 
-    - **高性能中间存储**: 使用 PostgreSQL 的 **UNLOGGED TABLES (不记录日志表)** 存储 MRP 计算的中间过程数据。由于不写 WAL 日志，其写入速度远快于普通表，非常适合 MRP 这种大规模计算后即丢弃的场景。
-    - **配置存储**: 使用 `JSONB` 存储每个方案的计算参数（如：是否包含预测、是否考虑安全库存等）。
-    - **示例代码**:
-      ```sql
-      -- 创建高性能中间表
-      CREATE UNLOGGED TABLE mrp_temp_results (
-          plan_id uuid, item_id int, net_qty numeric, plan_date date
-      );
-      ```
+- **逾期自动推延**: 针对逾期单据，MRP 引擎应提供“重排建议”（Reschedule Message），而非盲目假设供应依然有效。
+
+### 技术实现建议
+- **资源负荷计算**: 将工作中心的日历与可用工时存储为位图（Bitmap）或 `JSONB` 数组，快速进行“扣减”操作。
+- **高性能中间存储**: 使用 PostgreSQL 的 **UNLOGGED TABLES** 存储 MRP 计算的中间过程数据。
+- **示例代码**:
+  ```sql
+  -- 检查资源是否超载
+  SELECT wc_id, date, sum(required_hours) as load
+  FROM mrp_resource_plan
+  GROUP BY wc_id, date
+  HAVING sum(required_hours) > :max_capacity;
+  ```
 
 ---
 

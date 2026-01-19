@@ -5,41 +5,46 @@
 
 ---
 
-## 1. 料品检索与分类 (Search & Classification)
+## 1. 料品检索与多语言主数据 (Search & Multi-language)
 
 ### 业务场景
-制造企业中常有“一物多名”现象。采购部、工程部和供应商对同一料品的称呼可能完全不同。开发者需要提供极速且模糊的全局检索能力。
+制造企业中常有“一物多名”现象，且全球化企业要求料品名称、规格在不同语种（中文、英文、日文）下均有对应存储。开发者需要提供极速检索及多语种动态切换能力。
 
 ### 技术实现建议
-    - 针对料品名称、规格、别名等字段，推荐使用 PostgreSQL 的 **GIN 索引** 配合 `trgm` (trigram) 模块，实现高性能的模糊匹配（`LIKE '%keyword%'`）。
-    - 对于海量料品数据，可引入 **全文检索 (Full Text Search)**，支持权重排序，提升用户查找料品的效率。
-    - **示例代码**:
-      ```sql
-      -- 创建 trigram 索引优化模糊搜索
-      CREATE EXTENSION IF NOT EXISTS pg_trgm;
-      CREATE INDEX idx_item_name_trgm ON item_master USING gin (name gin_trgm_ops);
-      -- 搜索包含 'Steel' 的料品
-      SELECT * FROM item_master WHERE name ILIKE '%Steel%';
-      ```
+- **多语言存储模型**: 弃用“多列模式”（name_en, name_zh），推荐采用**中间表模式**或 **JSONB 模式**。
+    - **中间表模式**: `item_master_lang` 表存储 `item_id`, `lang_code`, `field_name`, `field_value`。适合字段极多且需频繁扩展语种的场景。
+    - **JSONB 模式**: 在 `item_master` 中定义 `name_i18n` (JSONB) 字段，存储 `{"zh": "钢板", "en": "Steel Plate"}`。
+- **高性能模糊检索**:
+    - 针对 `JSONB` 中的多语种字段，推荐使用 PostgreSQL 的 **GIN 索引** 配合 `jsonb_path_ops`。
+    - 配合 `trgm` (trigram) 模块，实现对 JSON 内部文本的高性能模糊匹配。
+- **示例代码**:
+  ```sql
+  -- 使用 JSONB 存储多语言名称
+  SELECT name_i18n->>'en' FROM item_master WHERE id = :id;
+  
+  -- 创建索引优化多语言模糊搜索
+  CREATE INDEX idx_item_name_i18n ON item_master USING gin (name_i18n);
+  ```
 
 ---
 
-## 2. 计量单位与高精度换算 (UOM & Conversion)
+## 2. 计量单位与变动换算率 (UOM & Variable Conversion)
 
 ### 业务场景
-“1吨钢材出库后，变成了 0.9999 吨”。这种误差通常源于换算率精度不足或不正确的存储基准。
+- **固定换算**: 1 盒 = 10 支（文具行业）。
+- **变动换算 (Variable Conversion)**: 针对农产品或化工行业，存在“非固定比例双单位换算”。例如：入库时按“件”，出库时按“重量”，但每件的重量由于水分挥发或个体差异并不固定。
 
 ### 开发规范
-- **主单位基准**: 所有库存结存、财务核算必须以“主单位”为唯一基准。
-- **双单位计量**: 针对农产品（如：按“件”入库，按“公斤”结算），需同时记录两个维度的数量。
+- **双单位强校验**: 针对设置了“变动换算”的料品，单据录入时必须强制用户同时输入两个单位的数量。
+- **换算率动态计算**: `Rate = Qty1 / Qty2`。系统需记录每笔业务发生时的“实际换算率”，而非仅使用主档的“标准换算率”。
 - **技术实现建议**: 
-    - 换算率必须定义为 `numeric(24, 12)`，确保在多次换算后不丢失精度。
-    - **JSONB 扩展**: 对于非线性的、复杂的换算规则（如根据温度、密度动态换算），可将换算算法参数存储在 `JSONB` 字段中。
-    - **示例代码**:
-      ```sql
-      -- 开发者需设计 `SecondQty` 字段存储辅助单位数量
-      ALTER TABLE inv_onhand ADD COLUMN second_qty numeric(24, 12);
-      ```
+    - 换算率必须定义为 `numeric(24, 12)`。
+    - **库存余额**: `inv_onhand` 必须同时存储 `Qty` (主单位) 和 `SecondQty` (辅助单位)，防止因换算率波动导致的“账实不符”。
+- **示例代码**:
+  ```sql
+  -- 每一行明细需存储交易时的实际换算率
+  ALTER TABLE inv_trans_line ADD COLUMN actual_conversion_rate numeric(24, 12);
+  ```
 
 ---
 

@@ -5,69 +5,115 @@
 
 ---
 
-## 1. 预测的多版本与多维度 (Multi-version & Dimension)
+## 业务痛点与开发对策
 
-### 企业痛点
-销售部给的是“乐观预测”，财务部给的是“稳健预测”。开发者如果只设计一个预测表，根本没法做协同。
-
-### 开发逻辑点
-- **版本控制**: 
-    - 开发者需支持 `Forecast_Version`。
-    - **PG 实现建议**: 利用 PostgreSQL 的 **分区表 (Partitioning)** 按版本或日期存储预测数据，提升 MRP 模拟时的查询性能。
-- **颗粒度转换**: 
-    - 开发者需实现一个“分摊比例引擎”。
-    - **PG 实现建议**: 使用 **窗口函数 (Window Functions)** 计算历史销量占比，并结合 **`LATERAL JOIN`** 实时分摊产品族预测到具体料号。
+| 业务痛点 | 技术对策 |
+| :--- | :--- |
+| **需求重复计算**：预测是 100，实际订单（SO）来了 20。若不冲销，MRP 会按 120 备料，导致库存积压。 | **预测冲销引擎 (Forecast_Consumption)**：在 SO 审核事务中，自动寻找对应时间桶（Bucket）的预测行进行数量抵扣。 |
+| **预测“乐观与稳健”**：销售和财务给的预测版本不一致。 | **多版本模拟 (Multi-Version)**：支持多个 Forecast_Version，并允许在运行 MRP 时选择特定的版本快照作为需求源。 |
+| **颗粒度断层**：销售只预测产品大类（如：笔记本电脑），生产需要具体型号（如：X1 Carbon）。 | **比例分摊引擎 (Pro-rata_Engine)**：利用历史销量比例，将产品族预测自动拆解为具体的 SKU 预测明细。 |
+| **过期预测干扰**：上个月没跑完的预测，不应再干扰本月的生产计划。 | **自动过期清理 (Auto-Expiration)**：利用 `pg_cron` 定期清理或归档 `valid_to < CURRENT_DATE` 且未冲销的预测行。 |
 
 ---
 
-## 2. 核心逻辑：预测冲销 (Forecast Consumption)
+## 1. 核心模型：时间桶与版本化 (Bucketing)
 
-### 企业痛点
-**“有了真实订单，预测还没消失”**。如果预测是 100，实际订单来了 20，若不冲销，MRP 就会按 120 备料。
+### 业务场景
+预测通常按周（Week）或按月（Month）汇总。
 
-### 开发算法
-- **冲销策略**: 
-    - **前/后冲销 (Forward/Backward)**。
-    - **PG 实现建议**: 利用 PostgreSQL 的 **`daterange`** 类型存储预测的时间桶，并使用 **`GIST` 索引** 极速查找 SO 交期所在的预测区间。
-- **冲销逻辑点**: 
-    - 当 SO 审核时，触发冲销。
-    - **PG 实现建议**: 使用 **存储过程 (PL/pgSQL)** 将冲销逻辑封装在数据库端。利用 **`FOR UPDATE SKIP LOCKED`** 处理高并发下的预测行锁定，确保冲销不重不漏。
-- **反冲销**: 
-    - SO 弃审时回退占用。
-    - **PG 实现建议**: 利用 **事务保存点 (Savepoints)** 或 **审计触发器 (Audit Triggers)** 记录冲销轨迹，确保反冲销时能精准还原数据。
-
----
-
-## 3. 预测的滚动管理 (Rolling Forecast)
-
-### 企业痛点
-预测是动态的，本周的预测到了下周就变成了历史。
-
-### 开发逻辑点
-- **过期自动清理**: 
-    - 定时任务标记失效。
-    - **PG 实现建议**: 使用 **`pg_cron`** 扩展在数据库层级定期执行过期预测的归档或清理。
-- **滑动窗口**: 
-    - 界面滑动展示。
-    - **PG 实现建议**: 利用 PostgreSQL 的 **交叉表 (Crosstab/Tablefunc)** 插件将行存储的预测数据快速转置为按月/周展示的列格式报表。
+### 技术实现建议
+- **时间范围存储**: 使用 PostgreSQL 的 `daterange` 类型。
+- **示例代码**:
+  ```sql
+  -- 创建带时间范围约束的预测表
+  CREATE TABLE mfg_forecast (
+    id serial PRIMARY KEY,
+    item_id int,
+    qty numeric(24, 12),
+    consumed_qty numeric(24, 12) DEFAULT 0,
+    valid_period daterange, -- [2024-01-01, 2024-02-01)
+    version_id int
+  );
+  ```
 
 ---
 
-## 4. 预测准确率分析 (Accuracy Tracking)
+## 2. 预测冲销算法 (Consumption Logic)
 
-### 企业痛点
-**“销售总是乱报预测”**。
+### 业务场景
+当一个销售订单（SO）交期为 1月15日时，它应该冲销掉 1月份的预测量。
 
-### 开发逻辑点
-- **对账视图**: 
-    - 对比 `预测量` vs `实际订单量`。
-    - **PG 实现建议**: 使用 **物化视图 (Materialized Views)** 预计算历史预测准确率，为 MRP 计划提供实时的修正因子。
+### 开发逻辑：前/后冲销策略
+1. **匹配桶**: 找到 SO 交期所在的 `valid_period`。
+2. **原子抵扣**: 使用 `UPDATE ... SET consumed_qty = consumed_qty + :so_qty`。
+3. **溢出处理**: 如果当前桶不够冲，是否向后一个桶继续冲？（由 `consumption_policy` 决定）。
+
+### 技术实现建议
+- **并发控制**: 使用 `SELECT ... FOR UPDATE` 锁定预测行。
+- **示例代码**:
+  ```sql
+  -- 预测冲销核心逻辑
+  UPDATE mfg_forecast 
+  SET consumed_qty = consumed_qty + :so_qty
+  WHERE item_id = :item_id 
+    AND valid_period @> :so_due_date -- SO 交期落在此区间内
+    AND (qty - consumed_qty) >= :so_qty
+  RETURNING id;
+  ```
+
+---
+
+## 3. 比例分摊引擎 (Allocation Engine)
+
+### 业务场景
+将“手机产品族”的 10,000 台预测，按历史销量比例拆分给“黑色 128G”和“白色 256G”。
+
+### 技术实现建议
+- **窗口函数分摊**:
+  ```sql
+  -- 根据过去 3 个月的销量比例自动分摊预测
+  WITH sales_history AS (
+    SELECT item_id, sum(qty) as history_total 
+    FROM sal_order_line 
+    WHERE due_date > CURRENT_DATE - interval '3 months'
+    GROUP BY item_id
+  ),
+  total_history AS (SELECT sum(history_total) as grand_total FROM sales_history)
+  SELECT 
+    sh.item_id,
+    (:family_forecast_qty * sh.history_total / th.grand_total) as allocated_qty
+  FROM sales_history sh, total_history th;
+  ```
+
+---
+
+## 4. 预测准确率分析 (Accuracy & Bias)
+
+### 业务场景
+对比“月初预测”与“月末实际订单”，识别哪些销售在“乱报”。
+
+### 技术实现建议
+- **物化视图预计算**:
+  ```sql
+  -- 预测准确率看板
+  CREATE MATERIALIZED VIEW mv_forecast_accuracy AS
+  SELECT 
+    item_id,
+    sum(qty) as forecast_qty,
+    sum(consumed_qty) as actual_qty,
+    (1 - abs(sum(qty) - sum(consumed_qty)) / NULLIF(sum(qty), 0)) as accuracy_rate
+  FROM mfg_forecast
+  GROUP BY item_id;
+  ```
 
 ---
 
 ## 5. 开发者 Checklist
 
-- [ ] **高精度计算**: 预测分摊和冲销是否统一使用 **`numeric`** 类型？
-- [ ] **多租户数据隔离**: 是否启用 **RLS** 确保各事业部的预测数据物理隔离？
-- [ ] **并发性能**: 高并发 SO 审核时，是否对预测表使用了索引优化的行锁？
-- [ ] **审计追踪**: 是否利用 **`JSONB`** 记录了每次冲销的详细流水（SO号、冲销前、冲销后、冲销策略）？
+- [ ] **高精度计算**: 冲销和分摊是否统一使用 `numeric(24, 12)`？
+- [ ] **冲销策略**: 系统是否支持“前冲销”、“后冲销”以及“不冲销”的可配置开关？
+- [ ] **并发性能**: 订单审核高峰期，冲销逻辑是否通过索引优化（GIST）避免了全表扫描？
+- [ ] **反审核处理**: SO 弃审时，是否能正确回退 `consumed_qty` 并记录反冲销日志？
+- [ ] **颗粒度对齐**: 预测是按周录入的，订单是按天录入的，冲销逻辑是否正确处理了日期重叠？
+- [ ] **多租户隔离**: 预测数据是否正确应用了 RLS（行级安全）策略？
+- [ ] **MRP 引用**: MRP 计划引擎在取需求时，是否使用的是 `(qty - consumed_qty)` 后的净需求？

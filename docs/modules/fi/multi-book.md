@@ -5,85 +5,103 @@
 
 ---
 
-## 1. 核心模型：主账簿与调整账簿
+## 业务痛点与开发对策
 
-### 企业痛点
-企业在 A 股上市要按中国准则（CAS），在美股上市要按美国准则（US GAAP）。如果开发者让用户录两遍凭证，财务人员会罢工，且数据极易出错。
-
-### 开发逻辑点
-- **账簿分类**:
-    - **主账簿 (Primary Ledger)**: 记录所有原始业务凭证。
-    - **调整账簿 (Adjustment Ledger)**: 仅记录不同准则之间的“差异分录”。
-- **虚拟账簿视图**: 开发者在写查询 SQL 时，必须实现“视图合并”：`GAAP 报表 = 主账簿数据 + 对应 GAAP 的调整账簿数据`。
-
-### PostgreSQL 实现建议
-- **物化视图与实时合并**: 使用 `UNION ALL` 结合 `VIEW` 实现主账簿与调整账簿的合并查询。对于报表展示，可以使用 `MATERIALIZED VIEW` 预计算合并结果，并配合 `REFRESH MATERIALIZED VIEW CONCURRENTLY` 实现无锁刷新。
-- **行级安全策略 (RLS)**: 对 `ledger_entry` 表应用 RLS，确保不同准则的审计人员只能看到其对应账簿的数据。
+| 业务痛点 | 技术对策 |
+| :--- | :--- |
+| **重复录入**：为了满足不同上市地的准则，财务人员要录入多遍凭证。 | **AEP 自动分流引擎 (AEP_Router)**：业务单据进入 AEP 后，利用 JSONB 存储的“路由规则栈”，根据预设准则自动并行生成多套账簿凭证。 |
+| **差异难对平**：中国准则和国际准则对研发支出的定义不同，导致资产总额对不上。 | **差异账簿模式 (Adjustment Ledger)**：采用“主账簿 + 差异项”模式，报表查询时利用 `UNION ALL` 动态合并，减少 50% 的冗余存储。 |
+| **折算损益（FCTR）计算难**：跨国集团月末按不同汇率折算，借贷不平。 | **自动挤平算法 (Rounding_Offset)**：在折算事务末尾自动检测借贷差额，并将其记入指定的“折算差额（FCTR）”科目。 |
+| **数据同步断裂**：主账记录改了，副账没改，导致审计失败。 | **两阶段提交 (2PC) / 原子事务**：将所有账簿的凭证生成/修改包裹在同一个数据库事务内，确保要么全成功，要么全失败。 |
 
 ---
 
-## 2. 差异核算逻辑 (Difference Accounting)
+## 1. 核心模型：主账簿与差异账簿 (Delta Storage)
 
-### 企业痛点
-中国准则规定研发支出要费用化，但某些准则允许资本化。这会导致资产负债表和损益表完全不同。
+### 业务场景
+企业在 A 股上市（CAS），同时在香港上市（IFRS）。
 
-### 开发逻辑点
-- **单向抛送**: 业务单据（如研发领料）进入 AEP。
-- **路由逻辑**: 
-    - 路由 A（主账簿）：`借：管理费用，贷：原材料`。
-    - 路由 B（IFRS 账簿）：`借：无形资产，贷：原材料`。
-- **差异同步**: 开发者需确保当业务单据被弃审时，所有关联账簿中的凭证必须**同步冲销**。
-
-### PostgreSQL 实现建议
-- **触发器联动**: 在 `ledger_primary` 表上设置 `AFTER DELETE` 或 `AFTER UPDATE` 触发器，自动同步删除或更新关联账簿中的凭证，确保数据的强一致性。
-- **JSONB 存储原始数据**: 在凭证行中使用 `JSONB` 存储业务单据的原始上下文，方便在不同准则下进行二次核算和差异追溯。
-
----
-
-## 3. 多本位币与折算 (Currency Translation)
-
-### 企业痛点
-越南子公司的本位币是越南盾，但集团总部要求看人民币报表。
-
-### 开发逻辑点
-- **折算账簿 (Translation Ledger)**: 这是一个特殊的账簿，其金额是根据汇率动态生成的。
-- **开发算法**:
-    - 损益类科目：按期间平均汇率折算。
-    - 资产负债类科目：按期末即期汇率折算。
-    - 实收资本：按历史汇率折算。
-- **FCTR (外币报表折算差额)**: 开发者必须 handle 折算后的借贷不平问题，将差额自动挤入 `FCTR` 科目。
-
-### PostgreSQL 实现建议
-- **自定义聚合函数**: 编写自定义聚合函数处理折算差额，利用 `SType` 在聚合过程中实时计算 FCTR。
-- **窗口函数计算平均汇率**: 
+### 技术实现建议
+- **动态视图合并**:
   ```sql
-  SELECT currency_code, 
-         AVG(rate) OVER(PARTITION BY currency_code, date_trunc('month', rate_date)) as avg_monthly_rate
-  FROM exchange_rates;
+  -- IFRS 账簿 = CAS 账簿数据 + IFRS 专用差异项
+  CREATE VIEW v_ifrs_ledger AS
+  SELECT account_id, amount, 'CAS' as source FROM ledger_cas
+  UNION ALL
+  SELECT account_id, amount, 'IFRS_DELTA' as source FROM ledger_adjustments 
+  WHERE target_gaap = 'IFRS';
   ```
-- **分区存储**: 折算数据通常量级巨大，建议按 `ledger_id` 进行列表分区（List Partitioning），提升跨账簿查询性能。
 
 ---
 
-## 4. 数据一致性与并发控制
+## 2. AEP 路由与分流逻辑 (AEP Routing)
 
-### 企业痛点
-如果主账簿过账成功，但由于网络波动，IFRS 账簿过账失败，会导致严重的账实不符。
+### 业务场景
+销售发票产生时，系统需自动生成两张凭证：一张入主账，一张入管理账（按内部管理成本）。
 
-### 开发逻辑点
-- **分布式事务/补偿机制**: 在 AEP 抛送多账簿时，必须使用强一致性事务。如果其中一个账簿写入失败，整个业务单据的财务状态必须回滚为“待入账”。
-- **流水号隔离**: 不同账簿的凭证流水号（Voucher Number）必须独立维护，严禁共用。
+### 开发规范
+- **路由规则配置**: 使用 JSONB 存储路由逻辑。
+  ```json
+  {
+    "event": "Sales_Invoice",
+    "ledgers": [
+      {"ledger_id": "L001", "rule_id": "R_CAS_SALE"},
+      {"ledger_id": "L002", "rule_id": "R_MGMT_SALE"}
+    ]
+  }
+  ```
+- **并发锁**: 在生成凭证前，必须使用 `SELECT ... FOR UPDATE` 锁定源业务单据，防止并发重写。
 
-### PostgreSQL 实现建议
-- **保存点 (SAVEPOINT)**: 在抛送多账簿凭证的 `PL/pgSQL` 过程中使用 `SAVEPOINT`，实现局部事务失败时的精准回滚。
-- **序列号 (SEQUENCE) 隔离**: 为每个账簿创建独立的 `SEQUENCE` 对象：`CREATE SEQUENCE voucher_seq_cas`, `CREATE SEQUENCE voucher_seq_ifrs`，确保流水号生成的原子性与独立性。
-- **咨询锁 (Advisory Locks)**: 在凭证过账期间，使用 `pg_advisory_xact_lock(business_doc_id)` 确保同一笔业务单据不会被多次并发抛送。
+---
+
+## 3. FCTR 折算差额计算 (Currency Translation)
+
+### 业务场景
+子公司本位币（Functional Currency）是越南盾，总部要求看人民币报表。
+
+### 技术实现建议
+- **挤平逻辑**: 开发者必须处理折算后由于小数位截断导致的 0.01 差异。
+  ```sql
+  -- 计算折算后的借贷差异
+  WITH converted_sum AS (
+      SELECT 
+        sum(dr_local) as total_dr, 
+        sum(cr_local) as total_cr 
+      FROM tmp_voucher_lines
+  )
+  INSERT INTO tmp_voucher_lines (account_id, dr_local)
+  SELECT :fctr_account_id, (total_cr - total_dr) 
+  FROM converted_sum 
+  WHERE total_cr != total_dr;
+  ```
+
+---
+
+## 4. 严谨性校验：弃审联动 (Un-approve Sync)
+
+### 业务场景
+业务单据（如采购发票）弃审时，所有关联账簿的凭证必须同步回滚。
+
+### 技术实现建议
+- **反审核拦截**: 
+  ```sql
+  -- 检查任一账簿是否已记账（Posted）
+  IF EXISTS (
+    SELECT 1 FROM gl_voucher 
+    WHERE source_doc_id = :id AND status = 'Posted'
+  ) THEN
+    RAISE EXCEPTION 'ERR_UNAPPROVE_FORBIDDEN: 关联的某套账簿凭证已记账，请先冲销凭证';
+  END IF;
+  ```
+- **同步清理**: 在同一个事务内删除所有账簿的草稿态凭证。
 
 ---
 
 ## 5. 开发者 Checklist
 
-- [ ] **多账簿路由配置**: 是否支持根据“业务类型”动态决定需要抛送哪些账簿？
-- [ ] **科目映射**: 是否处理了“跨账簿科目体系不一致”的情况？（主账簿用 4 位编码，调整账簿用 6 位编码）。
-- [ ] **审计日志**: 每一笔凭证是否都记录了其源业务单据的 `GUID`？
-- [ ] **性能压测**: 并行生成 3 套账簿凭证时，数据库的 IOPS 是否在可控范围内？
+- [ ] **科目映射**: 不同账簿的科目体系可能不同，系统是否实现了 `Account_Mapping_Table`？
+- [ ] **事务原子性**: 并行生成 N 套账簿凭证时，是否包裹在同一个 `BEGIN...COMMIT` 块内？
+- [ ] **审计足迹**: 调整账簿的凭证是否记录了“差异原因”和“原始凭证 ID”？
+- [ ] **分区性能**: 凭证表数据量巨大时，是否按 `ledger_id` 和 `fiscal_period` 进行了物理分区？
+- [ ] **汇率时效**: 资产负债类科目的折算汇率是否严格取自“期间末日”的汇率？
+- [ ] **AEP 性能**: 是否支持异步生成副账簿凭证，以减轻主业务操作的响应时间？

@@ -12,19 +12,23 @@
 
 ### 开发规范
 - **插入式检查**: 在单据行失去焦点时，自动触发 ATP 计算。
-- **模拟锁座 (Soft Reservation)**: 在订单未最终保存前，临时锁定 ATP 额度 5-10 分钟。
-- **技术实现建议**: 
-    - **时间维度计算**: 使用 PostgreSQL 的 **Window Functions (窗口函数)**。通过 `SUM(change_qty) OVER (ORDER BY plan_date)` 实时计算每个时间点的滚动可用量。
-    - **并发锁座**: 利用 `SELECT ... FOR UPDATE SKIP LOCKED` 锁定特定批次的“虚拟额度”，确保多个销售员同时下单时不产生超卖，且能快速跳过已锁定的额度。
+- **模拟锁座 (Soft Reservation)**: 在订单未最终保存前，临时锁定 ATP 额度。
+- **锁座超时与生命周期管理 (Lifecycle Management)**: 
+    - **自动释放**: 系统默认设置 15-30 分钟有效期（可配置）。利用 `pg_cron` 定期清理 `expire_at < now()` 的记录。
+    - **手动清理**: 提供“预留清理工作台”，允许计划员针对长期未转订单的预留（如大客户预留）进行手动释放。
+    - **状态闭环**: 
+        - `Active`: 预留中。
+        - `Consumed`: 已转正式订单，预留转为正式库存占用。
+        - `Expired`: 超时自动释放。
+        - `Released`: 手动释放。
+    - **技术实现建议**: 
+        - 在 `atp_reservation` 表中增加 `status` 和 `expire_at` 字段。
+        - **并发控制**: 利用 `SELECT ... FOR UPDATE SKIP LOCKED` 锁定特定批次的“虚拟额度”，确保多个销售员同时下单时不产生超卖，且能快速跳过已锁定的额度。
     - **示例代码**:
       ```sql
-      -- 计算滚动可用量 (PAB)
-      SELECT 
-          plan_date,
-          change_qty,
-          SUM(change_qty) OVER (ORDER BY plan_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as running_atp
-      FROM atp_supply_demand_view
-      WHERE item_id = :item_id;
+      -- 锁座记录示例
+      INSERT INTO atp_reservation (item_id, qty, expire_at)
+      VALUES (:item_id, :qty, now() + interval '10 min');
       ```
 
 ---

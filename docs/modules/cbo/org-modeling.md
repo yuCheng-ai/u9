@@ -29,23 +29,33 @@
 
 ---
 
-## 2. 数据隔离：多租户与组织上下文
+## 2. 数据隔离与 RBAC 权限继承 (Isolation & RBAC)
 
 ### 业务场景
-分公司 A 的业务员绝对不能查看到分公司 B 的库存或单据。这是 ERP 系统的安全红线。
+- **行级隔离**: 分公司 A 的业务员绝对不能查看到分公司 B 的库存或单据。
+- **权限继承**: 集团管理员在“集团”维度分配的权限，应能自动下发到所有子公司；但子公司管理员只能管理本公司的权限。
 
 ### 开发规范
-- **上下文透明**: 每一个 API 请求都必须携带 `OrgID`。开发者应通过 `Context` 对象获取当前操作组织，而不是让前端传参。
-- **自动隔离**: 所有的数据库查询必须强制包含 `org_id` 过滤。
-- **技术实现建议**: 
-    - 推荐利用数据库的 **RLS (行级安全)** 特性。
-    - 开发者只需在会话开始时设置 `SET LOCAL app.current_org_id = '...'`，后续所有的 `SELECT/UPDATE` 语句由数据库内核自动追加隔离条件，防止因代码疏忽导致的数据越权。
+- **权限向下继承**: 
+    - 权限分配表 `sys_permission` 需包含 `org_id` 和 `is_inherit` 标志。
+    - 当 `is_inherit = true` 时，该权限对当前组织及其所有下级子组织生效。
+- **上下文透明**: 每一个 API 请求都必须携带 `OrgID`。开发者应通过 `Context` 对象获取当前操作组织。
+
+### 技术实现建议
+- **递归权限判定**: 利用 PostgreSQL 的 **Recursive CTE** 向上查找当前用户在当前组织及其父级组织（带继承标志）的所有权限并取并集。
+- **行级安全 (RLS)**: 
+    - 开发者只需在会话开始时设置 `SET LOCAL app.current_org_id = '...'`。
     - **示例代码**:
       ```sql
-      -- 开启 RLS 策略
-      ALTER TABLE sales_order ENABLE ROW LEVEL SECURITY;
-      CREATE POLICY org_isolation_policy ON sales_order
-      USING (org_id = current_setting('app.current_org_id')::int);
+      -- 递归查询权限（考虑继承）
+      WITH RECURSIVE org_tree AS (
+          SELECT id, parent_id FROM org_master WHERE id = :current_org
+          UNION ALL
+          SELECT o.id, o.parent_id FROM org_master o JOIN org_tree ot ON o.id = ot.parent_id
+      )
+      SELECT p.* FROM sys_permission p
+      JOIN org_tree ot ON p.org_id = ot.id
+      WHERE p.user_id = :user_id AND (p.org_id = :current_org OR p.is_inherit = true);
       ```
 
 ---

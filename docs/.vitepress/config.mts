@@ -4,6 +4,7 @@ export default defineConfig({
   base: '/u9/',
   title: "自研 ERP 产品规格文档",
   description: "对标 U9 的自研 ERP 产品细节与业务逻辑指南",
+  cleanUrls: true,
   themeConfig: {
     nav: [
       { text: '首页', link: '/' },
@@ -15,7 +16,7 @@ export default defineConfig({
       {
         text: '产品入门',
         items: [
-          { text: '产品概览', link: '/index' },
+          { text: '产品概览', link: '/' },
           { text: '核心理念 (多组织/多核算)', link: '/guide/introduction' }
         ]
       },
